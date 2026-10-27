@@ -1,0 +1,54 @@
+name: Aurenyx Vaelor Android CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'android/**'
+      - '.github/workflows/android-ci.yml'
+  pull_request:
+    paths:
+      - 'android/**'
+  workflow_dispatch:
+
+jobs:
+  verify-and-build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Security Gate — Verify Zero Hardcoded API Keys in Android Tree
+        run: |
+          if grep -RInE "AIza[0-9A-Za-z_-]{25,}|sk-[A-Za-z0-9_-]{20,}|GEMINI_API_KEY\s*=\s*\"[^\"]+\"" android/app/src/main android/app/build.gradle.kts; then
+            echo "FATAL: Hardcoded credential pattern detected in Android source!"
+            exit 1
+          fi
+          echo "Security scan passed: zero hardcoded secrets in Android app source."
+
+      - name: Set up JDK 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Run Android JUnit Tests & Assemble Debug APK + Release Bundle
+        working-directory: android
+        run: gradle testDebugUnitTest assembleDebug bundleRelease --no-daemon
+
+      - name: Upload Debug APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aurenyx-vaelor-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Upload Release AAB Artifact (Unsigned unless GitHub Secrets provided)
+        uses: actions/upload-artifact@v4
+        with:
+          name: aurenyx-vaelor-release-aab
+          path: android/app/build/outputs/bundle/release/app-release.aab

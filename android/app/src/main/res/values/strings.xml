@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AURENYX VAELOR</string>
+    <string name="product_tagline">Intelligence, Orchestrated.</string>
+    <string name="official_attribution">AURENYX VAELOR — Founded by The Aether Vanguard, founded by Arenyx Sol Kael.</string>
+    <string name="trustgrid_headline">Turn AI innovation into trust.</string>
+    <string name="cd_send_message">Send message to Vaelor orchestrator</string>
+    <string name="cd_delete_history">Delete private chat history from device</string>
+    <string name="cd_refresh_status">Refresh backend gateway status</string>
+</resources>

@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
+  <defs>
+    <radialGradient id="vaelorBg" cx="50%" cy="35%" r="70%">
+      <stop offset="0%" stop-color="#2a1f47" />
+      <stop offset="100%" stop-color="#0b0a10" />
+    </radialGradient>
+    <linearGradient id="vaelorStroke" x1="16" y1="16" x2="112" y2="112" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#d8d0f5" />
+      <stop offset="50%" stop-color="#8b6ff7" />
+      <stop offset="100%" stop-color="#58429c" />
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="#0b0a10" />
+  <rect x="8" y="8" width="112" height="112" rx="22" fill="url(#vaelorBg)" stroke="url(#vaelorStroke)" stroke-width="2" />
+  <polygon points="64,24 98,64 64,104 30,64" stroke="#8b6ff7" stroke-width="2" fill="none" opacity="0.65" />
+  <circle cx="64" cy="64" r="28" stroke="#d8d0f5" stroke-width="2" opacity="0.9" />
+  <ellipse cx="64" cy="64" rx="13" ry="30" transform="rotate(45 64 64)" stroke="#a890fa" stroke-width="1.75" />
+  <ellipse cx="64" cy="64" rx="13" ry="30" transform="rotate(-45 64 64)" stroke="#a890fa" stroke-width="1.75" />
+  <circle cx="64" cy="64" r="5.5" fill="#f1eef9" />
+</svg>

@@ -1,0 +1,21 @@
+node_modules/
+build/
+dist/
+dev-dist/
+.playwright-cli/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Native Android Gradle & Keystore exclusions (never commit signing keys or local SDK paths)
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/keystore.properties
+android/**/*.jks
+android/**/*.keystore
+android/app/google-services.json
+

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- Exclude private on-device conversation store from cloud backups -->
+    <exclude domain="file" path="vaelor_private_store_v1.json" />
+    <exclude domain="sharedpref" path="." />
+</full-backup-content>

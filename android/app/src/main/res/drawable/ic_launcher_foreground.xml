@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Geometric Vaelor / TrustGrid Triangular A & V Emblem within 66dp safe zone -->
+    <path
+        android:fillColor="#8B6FF7"
+        android:pathData="M54,28L76,74H67.5L54,45.5L40.5,74H32L54,28Z" />
+    <path
+        android:fillColor="#35C8FF"
+        android:pathData="M43,62H65V67H43Z" />
+    <path
+        android:fillColor="#F6F4FC"
+        android:pathData="M54,48L60,60H48L54,48Z" />
+</vector>
