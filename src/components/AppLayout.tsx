@@ -3,6 +3,8 @@ import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import {
   Activity,
   AlertTriangle,
+  Archive,
+  ArchiveRestore,
   BookOpen,
   Check,
   CheckCircle2,
@@ -76,6 +78,7 @@ export const AppLayout: React.FC = () => {
     selectConversation,
     startNewConversation,
     renameConversation,
+    archiveConversation,
     deleteConversation,
   } = useWorkspace();
 
@@ -84,6 +87,7 @@ export const AppLayout: React.FC = () => {
   const [mobileAgentDrawerOpen, setMobileAgentDrawerOpen] = useState(false);
 
   const [historySearch, setHistorySearch] = useState('');
+  const [historyFilter, setHistoryFilter] = useState<'active' | 'archived'>('active');
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState('');
 
@@ -117,17 +121,31 @@ export const AppLayout: React.FC = () => {
         item.to === '/' ? location.pathname === '/' : location.pathname.startsWith(item.to)
       )?.label || 'Workspace';
 
+  const activeCount = useMemo(
+    () => conversations.filter((c) => !c.archived).length,
+    [conversations]
+  );
+  const archivedCount = useMemo(
+    () => conversations.filter((c) => Boolean(c.archived)).length,
+    [conversations]
+  );
+
   const filteredConversations = useMemo(() => {
     const q = historySearch.trim().toLowerCase();
-    if (!q) return conversations;
-    return conversations.filter(
-      (conv) =>
+    return conversations.filter((conv) => {
+      const matchesTab =
+        historyFilter === 'archived' ? Boolean(conv.archived) : !conv.archived;
+      if (!matchesTab) return false;
+      if (!q) return true;
+      return (
         conv.title.toLowerCase().includes(q) ||
         conv.messages.some((m) => m.content.toLowerCase().includes(q))
-    );
-  }, [conversations, historySearch]);
+      );
+    });
+  }, [conversations, historyFilter, historySearch]);
 
   const handleNewChat = () => {
+    setHistoryFilter('active');
     startNewConversation();
     if (location.pathname !== '/') {
       void navigate('/');
@@ -234,11 +252,36 @@ export const AppLayout: React.FC = () => {
         })}
       </nav>
 
-      {/* Conversation History + Search + Rename + Delete */}
+      {/* Conversation History + Search + Filter + Rename + Archive + Delete */}
       <div className="mt-3 flex min-h-0 flex-1 flex-col border-t border-white/8 px-3 pt-3">
         <div className="mb-2 flex items-center justify-between px-1 text-xs text-[#87809b]">
           <span>Session History</span>
-          <span className="font-mono tabular-nums">{filteredConversations.length}</span>
+          <div className="inline-flex items-center gap-1 rounded-md bg-[#13111d] p-0.5 text-[11px]">
+            <button
+              type="button"
+              onClick={() => setHistoryFilter('active')}
+              aria-pressed={historyFilter === 'active'}
+              className={`rounded px-2 py-0.5 font-medium transition-colors ${
+                historyFilter === 'active'
+                  ? 'bg-[#231d38] text-[#f5f3fc]'
+                  : 'text-[#87809b] hover:text-[#d8d2e8]'
+              }`}
+            >
+              Active ({activeCount})
+            </button>
+            <button
+              type="button"
+              onClick={() => setHistoryFilter('archived')}
+              aria-pressed={historyFilter === 'archived'}
+              className={`rounded px-2 py-0.5 font-medium transition-colors ${
+                historyFilter === 'archived'
+                  ? 'bg-[#231d38] text-[#f5f3fc]'
+                  : 'text-[#87809b] hover:text-[#d8d2e8]'
+              }`}
+            >
+              Archived ({archivedCount})
+            </button>
+          </div>
         </div>
 
         <div className="relative mb-2">
@@ -316,20 +359,34 @@ export const AppLayout: React.FC = () => {
                           setRenameDraft(conv.title);
                         }}
                         aria-label={`Rename conversation ${conv.title}`}
-                        className="inline-flex min-h-[36px] min-w-[32px] items-center justify-center rounded-md text-[#857e99] hover:text-[#e4dff2]"
+                        className="inline-flex min-h-[36px] min-w-[28px] items-center justify-center rounded-md text-[#857e99] hover:text-[#e4dff2]"
                       >
                         <Pencil className="h-3 w-3" />
                       </button>
-                      {conversations.length > 1 && (
-                        <button
-                          type="button"
-                          onClick={() => deleteConversation(conv.id)}
-                          aria-label={`Delete conversation ${conv.title}`}
-                          className="inline-flex min-h-[36px] min-w-[32px] items-center justify-center rounded-md text-[#857e99] hover:text-rose-300"
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
-                      )}
+                      <button
+                        type="button"
+                        onClick={() => archiveConversation(conv.id, !conv.archived)}
+                        aria-label={
+                          conv.archived
+                            ? `Unarchive conversation ${conv.title}`
+                            : `Archive conversation ${conv.title}`
+                        }
+                        className="inline-flex min-h-[36px] min-w-[28px] items-center justify-center rounded-md text-[#857e99] hover:text-[#c5b3fc]"
+                      >
+                        {conv.archived ? (
+                          <ArchiveRestore className="h-3.5 w-3.5" />
+                        ) : (
+                          <Archive className="h-3.5 w-3.5" />
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => deleteConversation(conv.id)}
+                        aria-label={`Delete conversation ${conv.title}`}
+                        className="inline-flex min-h-[36px] min-w-[28px] items-center justify-center rounded-md text-[#857e99] hover:text-rose-300"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
                     </>
                   )}
                 </div>

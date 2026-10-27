@@ -20,6 +20,8 @@ export const SettingsView: React.FC = () => {
     setLocalPersistenceEnabled,
     streamingEnabled,
     setStreamingEnabled,
+    mockMode,
+    setMockMode,
     gatewayState,
     health,
     refreshHealth,
@@ -172,6 +174,36 @@ export const SettingsView: React.FC = () => {
                 }`}
               >
                 Persist Locally
+              </button>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-3 py-3.5">
+            <div className="max-w-lg">
+              <p className="font-semibold text-[#f1eef9]">Local Mock Mode (₹0 UI Testing)</p>
+              <p className="text-[#958ea8]">
+                Simulate clearly labeled assistant responses locally without consuming Gemini API
+                free-tier quota. Deterministic tools still execute normally.
+              </p>
+            </div>
+            <div className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-[#0e0c16] p-1">
+              <button
+                type="button"
+                onClick={() => setMockMode(false)}
+                className={`min-h-[36px] rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap ${
+                  !mockMode ? 'bg-[#7c5dfa] text-white' : 'text-[#a59ec0] hover:text-[#f5f3fc]'
+                }`}
+              >
+                Live Gemini API
+              </button>
+              <button
+                type="button"
+                onClick={() => setMockMode(true)}
+                className={`min-h-[36px] rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap ${
+                  mockMode ? 'bg-amber-600 text-white' : 'text-[#a59ec0] hover:text-[#f5f3fc]'
+                }`}
+              >
+                Mock Mode
               </button>
             </div>
           </div>
@@ -391,9 +423,16 @@ export const SettingsView: React.FC = () => {
             Security (<code className="font-mono">auth.uid() = user_id</code>) verified server-side.
           </li>
           <li>
-            • <strong className="text-[#ece8f6]">Honest Version 0.1 Scope:</strong> Live web search
-            providers, binary scanned PDF OCR, and paid studio raster image models are intentionally
-            disconnected to preserve your ₹0 budget without fabricated results.
+            • <strong className="text-[#ece8f6]">Zero-Code Model Switching:</strong> Switch the
+            active Gemini model anytime via <code className="font-mono">VAELOR_DEFAULT_MODEL</code>{' '}
+            or <code className="font-mono">GEMINI_MODEL</code> in server environment variables
+            without editing frontend code.
+          </li>
+          <li>
+            • <strong className="text-[#ece8f6]">Honest Version 0.2 Scope:</strong> Grounded web
+            search uses server-side Gemini Google Search Grounding when quota permits; binary
+            scanned PDF OCR and paid studio raster image models remain disabled to protect your ₹0
+            budget.
           </li>
         </ul>
       </section>

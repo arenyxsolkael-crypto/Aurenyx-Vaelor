@@ -20,6 +20,8 @@ import type {
   ImageResolutionSize,
   KnowledgeDocument,
   ProjectWorkspace,
+  ResponseLength,
+  ResponseTone,
   SavedMemory,
   StructuredTaskRun,
   ToolAvailability,
@@ -41,6 +43,9 @@ export interface ToolInfo {
   description: string;
   allowedAgents: AgentId[];
   timeoutMs: number;
+  maxCallsPerTask?: number;
+  errorStrategy?: string;
+  outputSchemaSummary?: string;
   resultFormat: string;
   setupGuide?: string;
 }
@@ -51,6 +56,7 @@ export type ThemeMode = 'dark' | 'light';
 const THEME_STORAGE_KEY = 'vaelor_theme_mode';
 const PERSIST_PREF_KEY = 'vaelor_local_persist_enabled';
 const CONVERSATIONS_STORAGE_KEY = 'vaelor_saved_conversations_v1';
+const SESSION_TOKEN_STORAGE_KEY = 'vaelor_session_token_v1';
 
 interface WorkspaceContextValue {
   theme: ThemeMode;
@@ -71,6 +77,7 @@ interface WorkspaceContextValue {
   selectConversation: (id: string) => void;
   startNewConversation: (initialDraft?: string) => void;
   renameConversation: (id: string, title: string) => void;
+  archiveConversation: (id: string, archived: boolean) => void;
   clearActiveConversation: () => void;
   deleteConversation: (id: string) => void;
 
@@ -82,6 +89,12 @@ interface WorkspaceContextValue {
   setUseSentinel: React.Dispatch<React.SetStateAction<boolean>>;
   researchMode: boolean;
   setResearchMode: React.Dispatch<React.SetStateAction<boolean>>;
+  tone: ResponseTone;
+  setTone: React.Dispatch<React.SetStateAction<ResponseTone>>;
+  responseLength: ResponseLength;
+  setResponseLength: React.Dispatch<React.SetStateAction<ResponseLength>>;
+  mockMode: boolean;
+  setMockMode: React.Dispatch<React.SetStateAction<boolean>>;
 
   pendingAttachments: ChatAttachment[];
   addAttachment: (att: ChatAttachment) => void;
@@ -94,10 +107,17 @@ interface WorkspaceContextValue {
   dismissComposerError: () => void;
   sendMessage: (
     overrideMessage?: string,
-    options?: { researchModeOverride?: boolean }
+    options?: {
+      researchModeOverride?: boolean;
+      bypassCache?: boolean;
+      truncateFromMessageId?: string;
+      isEditedPrompt?: boolean;
+    }
   ) => Promise<void>;
   stopWaiting: () => void;
   retryFailedMessage: (failedPrompt: string) => Promise<void>;
+  editUserMessage: (messageId: string, newContent: string) => Promise<void>;
+  regenerateResponse: (assistantMessageId: string) => Promise<void>;
   generateVisualBlueprint: (params: {
     prompt: string;
     aspectRatio: ImageAspectRatio;
@@ -188,7 +208,22 @@ function readStoredConversations(fallback: Conversation): Conversation[] {
   return [fallback];
 }
 
+function readOrCreateSessionToken(): string {
+  try {
+    const existing = window.localStorage.getItem(SESSION_TOKEN_STORAGE_KEY);
+    if (existing && /^[a-zA-Z0-9_-]{8,80}$/.test(existing)) {
+      return existing;
+    }
+    const created = `sess_${crypto.randomUUID().replace(/-/g, '')}`;
+    window.localStorage.setItem(SESSION_TOKEN_STORAGE_KEY, created);
+    return created;
+  } catch {
+    return `sess_${crypto.randomUUID().replace(/-/g, '')}`;
+  }
+}
+
 export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const [sessionToken] = useState<string>(() => readOrCreateSessionToken());
   const [theme, setThemeState] = useState<ThemeMode>(() => readInitialTheme());
   const [localPersistenceEnabled, setLocalPersistenceState] = useState<boolean>(() =>
     readPersistencePref()
@@ -210,6 +245,9 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const [preferredAgent, setPreferredAgent] = useState<AgentId | 'auto'>('auto');
   const [useSentinel, setUseSentinel] = useState(true);
   const [researchMode, setResearchMode] = useState(false);
+  const [tone, setTone] = useState<ResponseTone>('balanced');
+  const [responseLength, setResponseLength] = useState<ResponseLength>('standard');
+  const [mockMode, setMockMode] = useState(false);
   const [pendingAttachments, setPendingAttachments] = useState<ChatAttachment[]>([]);
 
   const [isSending, setIsSending] = useState(false);
@@ -376,15 +414,104 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     [activeProjectId]
   );
 
-  const renameConversation = useCallback((id: string, title: string) => {
-    const clean = title.trim().slice(0, 72);
-    if (!clean) return;
-    setConversations((prev) =>
-      prev.map((c) =>
-        c.id === id ? { ...c, title: clean, updatedAt: new Date().toISOString() } : c
-      )
-    );
-  }, []);
+  const syncConversationToServer = useCallback(
+    async (conv: Conversation) => {
+      try {
+        await fetch('/api/conversations', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Vaelor-Session-Token': sessionToken,
+          },
+          body: JSON.stringify({
+            id: conv.id,
+            title: conv.title,
+            projectId: conv.projectId,
+            archived: Boolean(conv.archived),
+            messages: conv.messages
+              .filter((m) => !m.isStreaming)
+              .slice(-60)
+              .map((m) => ({
+                id: m.id,
+                role: m.role,
+                content: m.content.slice(0, 19500),
+                createdAt: m.createdAt,
+                editedAt: m.editedAt,
+                agentId: m.agentId,
+                agentName: m.agentName,
+                isMockResponse: m.isMockResponse,
+              })),
+            createdAt: conv.createdAt,
+            updatedAt: conv.updatedAt,
+          }),
+        });
+      } catch {
+        // Offline / ephemeral fallback
+      }
+    },
+    [sessionToken]
+  );
+
+  const renameConversation = useCallback(
+    (id: string, title: string) => {
+      const clean = title.trim().slice(0, 72);
+      if (!clean) return;
+      setConversations((prev) =>
+        prev.map((c) => {
+          if (c.id !== id) return c;
+          const next = { ...c, title: clean, updatedAt: new Date().toISOString() };
+          void fetch(`/api/conversations/${encodeURIComponent(id)}`, {
+            method: 'PATCH',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Vaelor-Session-Token': sessionToken,
+            },
+            body: JSON.stringify({ title: clean }),
+          }).catch(() => {});
+          return next;
+        })
+      );
+    },
+    [sessionToken]
+  );
+
+  const archiveConversation = useCallback(
+    (id: string, archived: boolean) => {
+      setConversations((prev) => {
+        const updated = prev.map((c) =>
+          c.id === id ? { ...c, archived, updatedAt: new Date().toISOString() } : c
+        );
+        if (archived && id === activeConversationId) {
+          const nextActive = updated.find((c) => !c.archived && c.id !== id);
+          if (nextActive) {
+            setActiveConversationId(nextActive.id);
+          } else {
+            const fresh = makeEmptyConversation(activeProjectId);
+            setActiveConversationId(fresh.id);
+            void fetch(`/api/conversations/${encodeURIComponent(id)}`, {
+              method: 'PATCH',
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Vaelor-Session-Token': sessionToken,
+              },
+              body: JSON.stringify({ archived }),
+            }).catch(() => {});
+            return [fresh, ...updated];
+          }
+        }
+        void fetch(`/api/conversations/${encodeURIComponent(id)}`, {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Vaelor-Session-Token': sessionToken,
+          },
+          body: JSON.stringify({ archived }),
+        }).catch(() => {});
+        return updated;
+      });
+    },
+    [activeConversationId, activeProjectId, sessionToken]
+  );
 
   const clearActiveConversation = useCallback(() => {
     setConversations((prev) =>
@@ -405,6 +532,10 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const deleteConversation = useCallback(
     (id: string) => {
+      void fetch(`/api/conversations/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+        headers: { 'X-Vaelor-Session-Token': sessionToken },
+      }).catch(() => {});
       setConversations((prev) => {
         const remaining = prev.filter((c) => c.id !== id);
         if (remaining.length === 0) {
@@ -413,12 +544,13 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           return [fresh];
         }
         if (id === activeConversationId) {
-          setActiveConversationId(remaining[0].id);
+          const preferred = remaining.find((c) => !c.archived) ?? remaining[0];
+          setActiveConversationId(preferred.id);
         }
         return remaining;
       });
     },
-    [activeConversationId, activeProjectId]
+    [activeConversationId, activeProjectId, sessionToken]
   );
 
   const stopWaiting = useCallback(() => {
@@ -431,7 +563,15 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   }, []);
 
   const sendMessage = useCallback(
-    async (overrideMessage?: string, options?: { researchModeOverride?: boolean }) => {
+    async (
+      overrideMessage?: string,
+      options?: {
+        researchModeOverride?: boolean;
+        bypassCache?: boolean;
+        truncateFromMessageId?: string;
+        isEditedPrompt?: boolean;
+      }
+    ) => {
       const text = (overrideMessage ?? draftInput).trim();
       if (!text || isSending) return;
 
@@ -445,12 +585,22 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       }
 
       const convId = activeConversation.id;
-      const priorMessages = activeConversation.messages.filter((m) => !m.error && !m.isStreaming);
+      const truncateIdx = options?.truncateFromMessageId
+        ? activeConversation.messages.findIndex((m) => m.id === options.truncateFromMessageId)
+        : -1;
+      const baseMessages =
+        truncateIdx >= 0
+          ? activeConversation.messages.slice(0, truncateIdx)
+          : activeConversation.messages;
+      const priorMessages = baseMessages.filter((m) => !m.error && !m.isStreaming);
+      const nowIso = new Date().toISOString();
+
       const userMsg: ChatMessage = {
         id: `msg_${crypto.randomUUID().slice(0, 8)}`,
         role: 'user',
         content: text,
-        createdAt: new Date().toISOString(),
+        createdAt: nowIso,
+        editedAt: options?.isEditedPrompt ? nowIso : undefined,
         attachments:
           attachmentsToSend.length > 0
             ? attachmentsToSend.map((a) => ({
@@ -468,15 +618,17 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       setConversations((prev) =>
         prev.map((c) => {
           if (c.id !== convId) return c;
+          const sliced =
+            truncateIdx >= 0 ? c.messages.slice(0, truncateIdx) : c.messages;
           const nextTitle =
-            c.messages.length === 0 && c.title === 'Untitled session'
+            sliced.length === 0 && c.title === 'Untitled session'
               ? text.slice(0, 44) + (text.length > 44 ? '…' : '')
               : c.title;
           return {
             ...c,
             title: nextTitle,
-            messages: [...c.messages, userMsg],
-            updatedAt: new Date().toISOString(),
+            messages: [...sliced, userMsg],
+            updatedAt: nowIso,
           };
         })
       );
@@ -494,8 +646,12 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         preferredAgent: preferredAgent === 'auto' ? undefined : preferredAgent,
         useSentinel,
         researchMode: effectiveResearchMode,
+        tone,
+        responseLength,
+        mockMode,
+        bypassCache: Boolean(options?.bypassCache),
         attachments: attachmentsToSend,
-        history: priorMessages.slice(-8).map((m) => ({
+        history: priorMessages.slice(-24).map((m) => ({
           role: m.role,
           content: m.content,
         })),
@@ -505,7 +661,10 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         if (streamingEnabled) {
           const res = await fetch('/api/chat/stream', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Vaelor-Session-Token': sessionToken,
+            },
             signal: controller.signal,
             body: JSON.stringify(requestBody),
           });
@@ -621,27 +780,29 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
               } else if (evt.type === 'complete') {
                 const finalReply = evt.reply ?? accumulated;
                 setConversations((prev) =>
-                  prev.map((c) =>
-                    c.id === convId
-                      ? {
-                          ...c,
-                          messages: c.messages.map((m) =>
-                            m.id === streamingMsgId
-                              ? {
-                                  ...m,
-                                  content: finalReply,
-                                  agentId: evt.taskRun?.selectedAgent,
-                                  agentName: evt.taskRun?.agentName || 'Vaelor Core',
-                                  taskRun: evt.taskRun,
-                                  generatedSvgBlueprint: evt.generatedSvgBlueprint,
-                                  isStreaming: false,
-                                }
-                              : m
-                          ),
-                          updatedAt: new Date().toISOString(),
-                        }
-                      : c
-                  )
+                  prev.map((c) => {
+                    if (c.id !== convId) return c;
+                    const updatedConv: Conversation = {
+                      ...c,
+                      messages: c.messages.map((m) =>
+                        m.id === streamingMsgId
+                          ? {
+                              ...m,
+                              content: finalReply,
+                              agentId: evt.taskRun?.selectedAgent,
+                              agentName: evt.taskRun?.agentName || 'Vaelor Core',
+                              taskRun: evt.taskRun,
+                              generatedSvgBlueprint: evt.generatedSvgBlueprint,
+                              isStreaming: false,
+                              isMockResponse: Boolean(evt.taskRun?.isMockResponse),
+                            }
+                          : m
+                      ),
+                      updatedAt: new Date().toISOString(),
+                    };
+                    void syncConversationToServer(updatedConv);
+                    return updatedConv;
+                  })
                 );
                 setActiveStage(
                   `Completed via ${evt.taskRun?.agentName || 'Vaelor Core'} (${
@@ -685,7 +846,10 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         // Unary fallback path when streaming toggle is off
         const res = await fetch('/api/chat', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Vaelor-Session-Token': sessionToken,
+          },
           signal: controller.signal,
           body: JSON.stringify(requestBody),
         });
@@ -744,18 +908,20 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           agentName: data.taskRun?.agentName || 'Vaelor Core',
           taskRun: data.taskRun,
           generatedSvgBlueprint: data.generatedSvgBlueprint,
+          isMockResponse: Boolean(data.taskRun?.isMockResponse),
         };
 
         setConversations((prev) =>
-          prev.map((c) =>
-            c.id === convId
-              ? {
-                  ...c,
-                  messages: [...c.messages, assistantMsg],
-                  updatedAt: new Date().toISOString(),
-                }
-              : c
-          )
+          prev.map((c) => {
+            if (c.id !== convId) return c;
+            const updatedConv: Conversation = {
+              ...c,
+              messages: [...c.messages, assistantMsg],
+              updatedAt: new Date().toISOString(),
+            };
+            void syncConversationToServer(updatedConv);
+            return updatedConv;
+          })
         );
 
         setActiveStage(
@@ -802,7 +968,12 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       activeProjectId,
       preferredAgent,
       useSentinel,
+      tone,
+      responseLength,
+      mockMode,
+      sessionToken,
       streamingEnabled,
+      syncConversationToServer,
       refreshWorkspaceData,
       refreshHealth,
     ]
@@ -810,9 +981,44 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const retryFailedMessage = useCallback(
     async (failedPrompt: string) => {
-      await sendMessage(failedPrompt);
+      await sendMessage(failedPrompt, { bypassCache: true });
     },
     [sendMessage]
+  );
+
+  const editUserMessage = useCallback(
+    async (messageId: string, newContent: string) => {
+      const trimmed = newContent.trim();
+      if (!trimmed || isSending) return;
+      await sendMessage(trimmed, {
+        bypassCache: true,
+        truncateFromMessageId: messageId,
+        isEditedPrompt: true,
+      });
+    },
+    [isSending, sendMessage]
+  );
+
+  const regenerateResponse = useCallback(
+    async (assistantMessageId: string) => {
+      if (isSending) return;
+      const msgs = activeConversation.messages;
+      const assistantIdx = msgs.findIndex((m) => m.id === assistantMessageId);
+      if (assistantIdx < 0) return;
+      let userMsgToReplay: ChatMessage | undefined;
+      for (let idx = assistantIdx - 1; idx >= 0; idx -= 1) {
+        if (msgs[idx].role === 'user') {
+          userMsgToReplay = msgs[idx];
+          break;
+        }
+      }
+      if (!userMsgToReplay) return;
+      await sendMessage(userMsgToReplay.content, {
+        bypassCache: true,
+        truncateFromMessageId: userMsgToReplay.id,
+      });
+    },
+    [activeConversation.messages, isSending, sendMessage]
   );
 
   const generateVisualBlueprint = useCallback(
@@ -1024,7 +1230,10 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     async (scope: 'conversations' | 'memories' | 'documents' | 'tasks' | 'all') => {
       await fetch('/api/session/purge', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Vaelor-Session-Token': sessionToken,
+        },
         body: JSON.stringify({ scope }),
       });
       if (scope === 'conversations' || scope === 'all') {
@@ -1043,7 +1252,7 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       await refreshWorkspaceData();
       await refreshHealth();
     },
-    [refreshWorkspaceData, refreshHealth]
+    [refreshWorkspaceData, refreshHealth, sessionToken]
   );
 
   const value: WorkspaceContextValue = {
@@ -1062,6 +1271,7 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     selectConversation,
     startNewConversation,
     renameConversation,
+    archiveConversation,
     clearActiveConversation,
     deleteConversation,
     draftInput,
@@ -1072,6 +1282,12 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     setUseSentinel,
     researchMode,
     setResearchMode,
+    tone,
+    setTone,
+    responseLength,
+    setResponseLength,
+    mockMode,
+    setMockMode,
     pendingAttachments,
     addAttachment,
     removeAttachment,
@@ -1083,6 +1299,8 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     sendMessage,
     stopWaiting,
     retryFailedMessage,
+    editUserMessage,
+    regenerateResponse,
     generateVisualBlueprint,
     projects,
     activeProjectId,

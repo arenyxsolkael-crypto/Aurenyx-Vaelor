@@ -20,6 +20,7 @@ export const ResearchView: React.FC = () => {
   const [loadingMatrix, setLoadingMatrix] = useState(false);
 
   const liveSearchReady = Boolean(health?.liveSearchConfigured);
+  const searchMode = health?.groundedSearchMode ?? 'unavailable';
 
   const handleLaunchResearchSession = (e: React.FormEvent) => {
     e.preventDefault();
@@ -29,10 +30,12 @@ export const ResearchView: React.FC = () => {
     const structuredPrompt = [
       `Research Investigation Topic: ${cleanTopic}`,
       constraints.trim() ? `Scope & Constraints: ${constraints.trim()}` : '',
-      'Please structure your analysis into:',
-      '1. Verified Findings & Established Facts (citing indexed session documents if relevant)',
-      '2. Interpretations & Working Assumptions',
-      '3. Open Unknowns & Primary-Source Verification Plan',
+      'Please structure your analysis into the 5-part Aurenyx Research v0.2 format:',
+      '1. Direct Answer',
+      '2. Key Findings',
+      '3. Evidence & Citations (cite retrieved web sources or indexed session documents strictly when verified)',
+      '4. Uncertainties & Limitations',
+      '5. Sources',
     ]
       .filter(Boolean)
       .join('\n');
@@ -71,14 +74,15 @@ export const ResearchView: React.FC = () => {
         <div className="space-y-1.5">
           <div className="flex items-center gap-2 text-xs text-[#a58ff8]">
             <Compass className="h-4 w-4" />
-            <span>Aurenyx Research Specialist</span>
+            <span>Aurenyx Research Specialist · v0.2 Grounded Synthesis</span>
           </div>
           <h1 className="text-2xl font-bold tracking-tight text-[#f6f4fc]">
             Research Mode & Source Honesty Studio
           </h1>
           <p className="max-w-3xl text-sm leading-relaxed text-[#9e97b0]">
-            Structured multi-angle inquiry that separates verified facts, working assumptions, and
-            open unknowns—never fabricating citations, DOIs, or unverified web search claims.
+            Structured 5-part inquiry combining server-side Gemini Google Search Grounding (when
+            available), indexed documents, and strict separation of verified facts from open
+            unknowns—never fabricating URLs or citations.
           </p>
         </div>
 
@@ -86,12 +90,16 @@ export const ResearchView: React.FC = () => {
         <section className="rounded-2xl border border-white/10 bg-[#13111d] p-5 space-y-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <h2 className="text-sm font-semibold text-[#f5f3fc]">
-              External Web Search Provider Status
+              Grounded Web Search Connector Status
             </h2>
             {liveSearchReady ? (
               <span className="inline-flex items-center gap-1.5 text-xs text-emerald-300">
                 <CheckCircle2 className="h-4 w-4" />
-                <span>Authorized Search Key Configured</span>
+                <span>
+                  {searchMode === 'gemini-google-search'
+                    ? 'Gemini Google Search Grounding Enabled'
+                    : 'Authorized Search Connector Ready'}
+                </span>
               </span>
             ) : (
               <span className="inline-flex items-center gap-1.5 text-xs text-amber-300">
@@ -102,13 +110,12 @@ export const ResearchView: React.FC = () => {
           </div>
           <p className="text-xs leading-relaxed text-[#a8a1bd]">
             {liveSearchReady
-              ? 'Server SEARCH_API_KEY is present.'
-              : 'No external web search API key (SEARCH_API_KEY) is currently configured on the server. Aurenyx Research synthesizes established domain knowledge and your '}
-            {!liveSearchReady && (
-              <strong className="text-[#ece8f6]">{documents.length} indexed session documents</strong>
-            )}
-            {!liveSearchReady &&
-              ', while explicitly flagging live prices, breaking news, or unverified URLs as Open Unknowns.'}
+              ? `web_search_connector is active via ${
+                  searchMode === 'gemini-google-search'
+                    ? 'server-side Gemini Google Search Grounding'
+                    : 'SEARCH_API_KEY'
+                } plus your ${documents.length} indexed session documents. If upstream search quota is throttled or returns zero web chunks, Aurenyx Research reports that transparently without inventing URLs.`
+              : `No server API key is currently active for live search. Aurenyx Research synthesizes established domain knowledge and your ${documents.length} indexed session documents, while explicitly flagging live prices, breaking news, or unverified URLs under Uncertainties & Limitations.`}
           </p>
         </section>
 

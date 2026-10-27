@@ -1,7 +1,8 @@
 import { z } from 'zod';
 
 export const MAX_MESSAGE_LENGTH = 8000;
-export const MAX_HISTORY_ITEMS = 10;
+export const MAX_HISTORY_ITEMS = 24;
+export const MAX_CONTEXT_WINDOW_TURNS = 8;
 export const MAX_DOCUMENT_LENGTH = 60000;
 export const MAX_MEMORY_LENGTH = 1200;
 export const MAX_ATTACHMENT_TEXT_LENGTH = 30000;
@@ -11,9 +12,20 @@ export const AgentIdSchema = z.enum([
   'vaelor-core',
   'aurenyx-research',
   'vaelor-forge',
+  'vaelor-analyst',
   'vaelor-knowledge',
   'vaelor-sentinel',
 ]);
+
+export const ResponseToneSchema = z.enum([
+  'balanced',
+  'professional',
+  'friendly',
+  'academic',
+  'direct',
+]);
+
+export const ResponseLengthSchema = z.enum(['concise', 'standard', 'detailed']);
 
 export const ChatAttachmentSchema = z.object({
   id: z.string().trim().min(1).max(80),
@@ -39,27 +51,59 @@ export const ChatRequestSchema = z.object({
     .string()
     .trim()
     .min(1, 'Message cannot be empty.')
-    .max(MAX_MESSAGE_LENGTH, `Message exceeds the ${MAX_MESSAGE_LENGTH.toLocaleString()}-character limit.`),
+    .max(
+      MAX_MESSAGE_LENGTH,
+      `Message exceeds the ${MAX_MESSAGE_LENGTH.toLocaleString()}-character limit.`
+    ),
   conversationId: z.string().trim().max(120).optional(),
   projectId: z.string().trim().max(120).optional(),
   preferredAgent: AgentIdSchema.optional(),
   useSentinel: z.boolean().optional().default(true),
   researchMode: z.boolean().optional().default(false),
+  tone: ResponseToneSchema.optional().default('balanced'),
+  responseLength: ResponseLengthSchema.optional().default('standard'),
+  mockMode: z.boolean().optional().default(false),
+  bypassCache: z.boolean().optional().default(false),
   requestedTools: z.array(z.string().trim().max(64)).max(5).optional(),
   attachments: z.array(ChatAttachmentSchema).max(2).optional().default([]),
-  history: z
-    .array(ChatMessageInputSchema)
-    .max(MAX_HISTORY_ITEMS)
-    .optional()
-    .default([]),
+  history: z.array(ChatMessageInputSchema).max(MAX_HISTORY_ITEMS).optional().default([]),
+});
+
+export const StoredChatMessageSchema = z.object({
+  id: z.string().trim().min(1).max(120),
+  role: z.enum(['user', 'assistant']),
+  content: z.string().max(20000),
+  createdAt: z.string().trim().min(4).max(64),
+  editedAt: z.string().trim().max(64).optional(),
+  agentId: AgentIdSchema.optional(),
+  agentName: z.string().trim().max(120).optional(),
+  isMockResponse: z.boolean().optional(),
+});
+
+export const ConversationSyncSchema = z.object({
+  id: z.string().trim().min(2).max(120),
+  title: z.string().trim().min(1).max(120),
+  projectId: z.string().trim().max(120).optional(),
+  archived: z.boolean().optional().default(false),
+  messages: z.array(StoredChatMessageSchema).max(100).optional().default([]),
+  createdAt: z.string().trim().max(64).optional(),
+  updatedAt: z.string().trim().max(64).optional(),
+});
+
+export const ConversationPatchSchema = z.object({
+  title: z.string().trim().min(1).max(120).optional(),
+  archived: z.boolean().optional(),
 });
 
 export const ToolDirectExecuteSchema = z.object({
   tool: z.enum([
     'calculator',
     'datetime_utility',
+    'text_summarizer',
     'text_transformer',
     'json_validator',
+    'structured_formatter',
+    'task_planner',
     'csv_analyzer',
     'chart_generator',
     'research_framework',
@@ -110,7 +154,10 @@ export const DocumentIngestSchema = z.object({
     .string()
     .trim()
     .min(10, 'Document text must contain at least 10 characters.')
-    .max(MAX_DOCUMENT_LENGTH, `Document text exceeds the ${MAX_DOCUMENT_LENGTH.toLocaleString()}-character prototype limit.`),
+    .max(
+      MAX_DOCUMENT_LENGTH,
+      `Document text exceeds the ${MAX_DOCUMENT_LENGTH.toLocaleString()}-character prototype limit.`
+    ),
 });
 
 export const StudioVisualRequestSchema = z.object({
@@ -145,11 +192,13 @@ const PROMPT_INJECTION_PATTERNS: { pattern: RegExp; reason: string }[] = [
     reason: 'Attempted system instruction override',
   },
   {
-    pattern: /\b(reveal|print|dump|output|expose|echo)\b.{0,40}\b(system\s+prompt|api[_\s-]?key|gemini_api_key|process\.env|environment\s+variables|secrets?)\b/i,
+    pattern:
+      /\b(reveal|print|dump|output|expose|echo)\b.{0,40}\b(system\s+prompt|api[_\s-]?key|gemini_api_key|process\.env|environment\s+variables|secrets?)\b/i,
     reason: 'Attempted secret or system configuration exfiltration',
   },
   {
-    pattern: /\b(grant|enable|unlock|escalate)\b.{0,35}\b(all\s+tools|shell|bash|sudo|admin|root|unrestricted)\b/i,
+    pattern:
+      /\b(grant|enable|unlock|escalate)\b.{0,35}\b(all\s+tools|shell|bash|sudo|admin|root|unrestricted)\b/i,
     reason: 'Attempted unauthorized tool or privilege escalation',
   },
   {
@@ -193,7 +242,10 @@ export class SlidingWindowRateLimiter {
     this.maxRequests = options.maxRequests;
   }
 
-  public check(key: string, now = Date.now()): { allowed: boolean; remaining: number; retryAfterSeconds: number } {
+  public check(
+    key: string,
+    now = Date.now()
+  ): { allowed: boolean; remaining: number; retryAfterSeconds: number } {
     const timestamps = (this.hits.get(key) ?? []).filter((t) => now - t < this.windowMs);
     if (timestamps.length >= this.maxRequests) {
       const oldest = timestamps[0] ?? now;

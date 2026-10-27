@@ -2,6 +2,7 @@ import React from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   ArrowUpRight,
+  BarChart3,
   BookOpen,
   Code2,
   Compass,
@@ -17,6 +18,7 @@ const ROLE_ICON: Record<AgentId, React.ComponentType<{ className?: string }>> = 
   'vaelor-core': Cpu,
   'aurenyx-research': Compass,
   'vaelor-forge': Code2,
+  'vaelor-analyst': BarChart3,
   'vaelor-knowledge': BookOpen,
   'vaelor-sentinel': ShieldCheck,
 };
@@ -39,9 +41,9 @@ export const AgentsView: React.FC = () => {
           Specialist Agents & Tool Allowlists
         </h1>
         <p className="max-w-3xl text-sm leading-relaxed text-[#9e97b0]">
-          Vaelor routes requests across four dedicated specialist roles plus Vaelor Core. Each role
-          operates under a strict server-side tool allowlist and a maximum ceiling of 4 model calls
-          per user request.
+          Vaelor routes requests across five dedicated specialist roles plus Vaelor Core. Each role
+          operates under a strict server-side tool allowlist, schema-validated planner boundaries,
+          and a maximum ceiling of 4 model calls per user request.
         </p>
       </div>
 
@@ -116,12 +118,13 @@ export const AgentsView: React.FC = () => {
         <div className="flex items-center gap-2">
           <Wrench className="h-4 w-4 text-[#a58ff8]" />
           <h2 className="text-base font-semibold text-[#f5f3fc]">
-            Permission-Controlled Tool Registry (v0.1)
+            Permission-Controlled Tool Registry (v0.2)
           </h2>
         </div>
         <p className="text-xs text-[#958ea8]">
-          All tool arguments are validated with server-side Zod schemas. Shell execution, arbitrary
-          filesystem access, and unrestricted web browsing are strictly prohibited.
+          All tool inputs and outputs are validated with server-side Zod schemas, per-task call
+          budgets, and bounded timeouts. Shell execution and arbitrary filesystem access are
+          strictly prohibited.
         </p>
 
         <div className="overflow-x-auto rounded-2xl border border-white/10 bg-[#13111d]">
@@ -130,9 +133,9 @@ export const AgentsView: React.FC = () => {
               <tr>
                 <th className="px-4 py-3 font-medium">Tool Name</th>
                 <th className="px-4 py-3 font-medium">Stage & Status</th>
-                <th className="px-4 py-3 font-medium">Purpose</th>
+                <th className="px-4 py-3 font-medium">Purpose & Output Schema</th>
                 <th className="px-4 py-3 font-medium">Authorized Specialists</th>
-                <th className="px-4 py-3 text-right font-medium">Timeout</th>
+                <th className="px-4 py-3 text-right font-medium">Limits</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-white/6 text-[#d5cfe6]">
@@ -151,6 +154,11 @@ export const AgentsView: React.FC = () => {
                   </td>
                   <td className="px-4 py-3 text-[#b5add0]">
                     <p>{tool.description}</p>
+                    {tool.outputSchemaSummary && (
+                      <p className="mt-1 font-mono text-[11px] text-[#8f88a3]">
+                        Output: {tool.outputSchemaSummary}
+                      </p>
+                    )}
                     {tool.setupGuide && (
                       <p className="mt-1 text-[11px] text-[#958ea8]">{tool.setupGuide}</p>
                     )}
@@ -160,6 +168,7 @@ export const AgentsView: React.FC = () => {
                   </td>
                   <td className="px-4 py-3 text-right font-mono tabular-nums text-[#9e97b0] whitespace-nowrap">
                     {tool.timeoutMs} ms
+                    {tool.maxCallsPerTask ? ` · max ${tool.maxCallsPerTask}/task` : ''}
                   </td>
                 </tr>
               ))}

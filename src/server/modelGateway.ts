@@ -1,8 +1,10 @@
+import crypto from 'node:crypto';
 import { GoogleGenAI, Type, type Part } from '@google/genai';
 import type {
   AIRequest,
   AIResponse,
   ChatAttachment,
+  CitationItem,
   ImageAspectRatio,
   ImageResolutionSize,
   ModelCapabilities,
@@ -14,6 +16,7 @@ export type GatewayErrorCode =
   | 'QUOTA_EXCEEDED'
   | 'MODEL_UNAVAILABLE'
   | 'TIMEOUT'
+  | 'CANCELLED'
   | 'INVALID_OUTPUT'
   | 'PAID_TIER_REQUIRED'
   | 'PROVIDER_ERROR';
@@ -49,17 +52,25 @@ export interface TextGenerationRequest {
   tier?: 'primary' | 'fast';
   timeoutMs?: number;
   maxOutputChars?: number;
+  mockMode?: boolean;
+  bypassCache?: boolean;
+  cacheScope?: string;
+  signal?: AbortSignal;
 }
 
 export interface TextGenerationResponse {
   text: string;
   modelUsed: string;
+  isMockResponse?: boolean;
+  cached?: boolean;
 }
 
 export interface SentinelJsonReviewRequest {
   systemInstruction: string;
   prompt: string;
   timeoutMs?: number;
+  mockMode?: boolean;
+  signal?: AbortSignal;
 }
 
 export interface SentinelJsonReviewResponse {
@@ -68,6 +79,14 @@ export interface SentinelJsonReviewResponse {
   summary: string;
   revisedAnswer: string;
   modelUsed: string;
+}
+
+export interface GroundedWebSearchResult {
+  status: 'ok' | 'no_sources' | 'unavailable';
+  query: string;
+  summaryText: string;
+  citations: CitationItem[];
+  note: string;
 }
 
 export interface StudioImageGenerationRequest {
@@ -91,22 +110,40 @@ export interface GatewayConfigurationStatus {
   fastModel: string;
   paidModelsEnabled: boolean;
   liveSearchConfigured?: boolean;
+  groundedSearchMode?: 'gemini-google-search' | 'external-search-key' | 'unavailable';
+  mockModeDefault?: boolean;
 }
 
+/**
+ * Clean Provider Adapter & Model Gateway Interface (VAELOR CORE v0.2).
+ * Supports generateResponse(), streamResponse(), checkProviderAvailability(),
+ * grounded search, Sentinel JSON critique, and backward-compatible v0.1 methods.
+ */
 export interface ModelGateway {
   getStatus(): GatewayConfigurationStatus;
+  checkProviderAvailability?(): Promise<{
+    available: boolean;
+    provider: string;
+    configured: boolean;
+    primaryModel: string;
+    reason?: string;
+  }>;
   getCapabilities?(): Promise<ModelCapabilities>;
+  generateResponse?(input: AIRequest): Promise<AIResponse>;
+  streamResponse?(input: AIRequest): AsyncIterable<{ delta: string; modelUsed: string }>;
   generate?(input: AIRequest): Promise<AIResponse>;
   stream?(input: AIRequest): AsyncIterable<{ delta: string; modelUsed: string }>;
   generateText(req: TextGenerationRequest): Promise<TextGenerationResponse>;
   generateSentinelReview(req: SentinelJsonReviewRequest): Promise<SentinelJsonReviewResponse>;
+  searchGroundedWeb?(query: string, options?: { timeoutMs?: number; signal?: AbortSignal }): Promise<GroundedWebSearchResult>;
   generateStudioImage(req: StudioImageGenerationRequest): Promise<StudioImageGenerationResponse>;
 }
 
 const DEFAULT_PRIMARY_MODEL = 'gemini-3.1-flash-lite';
 const DEFAULT_FAST_MODEL = 'gemini-3.1-flash-lite';
-const DEFAULT_TIMEOUT_MS = 28_000;
+const DEFAULT_TIMEOUT_MS = 22_000;
 const DEFAULT_MAX_OUTPUT_CHARS = 14_000;
+const MAX_CACHE_ENTRIES = 32;
 
 function buildContentsWithAttachments(
   turns: GatewayTurn[],
@@ -139,8 +176,69 @@ function buildContentsWithAttachments(
   });
 }
 
+/**
+ * Generates an explicitly labeled simulated response ONLY when Local Mock Mode is enabled.
+ * Never claims to be real AI model inference.
+ */
+export function buildExplicitLocalMockText(turns: GatewayTurn[]): string {
+  const latestUserText = turns[turns.length - 1]?.text ?? '';
+  const lower = latestUserText.toLowerCase();
+
+  const header =
+    '> **[LOCAL MOCK MODE — Simulated UI Test Response]**\n> *This output was generated locally for ₹0 interface verification and is NOT real AI model inference.*\n\n';
+
+  // Surface any deterministic local calculator output attached by the orchestrator
+  const calcMatch = latestUserText.match(
+    /Approved Tool Output \(calculator\):\s*\{[\s\S]*?"expression"\s*:\s*"([^"]+)"[\s\S]*?"value"\s*:\s*([0-9.eE+-]+)/
+  );
+  const calcLine = calcMatch
+    ? `\n- **Verified Calculator Tool Output:** \`${calcMatch[1]} = ${calcMatch[2]}\``
+    : '';
+
+  if (/\b(quadratic|equation|calculus|math|formula|integral|sqrt|calculate)\b/.test(lower)) {
+    return (
+      header +
+      '### Mathematical & Quantitative Breakdown (Simulated)\n\n' +
+      'For a standard quadratic equation $ax^2 + bx + c = 0$ with $a \\neq 0$, the roots are given by:\n\n' +
+      '$$x = \\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}$$\n\n' +
+      '- **Inline check:** Energy-mass equivalence is expressed as $E = mc^2$.' +
+      calcLine +
+      '\n- **Deterministic verification:** Any approved `calculator` tool output attached to this run is cross-checked by Vaelor Sentinel.'
+    );
+  }
+
+  if (/\b(code|typescript|javascript|python|function|test|debug)\b/.test(lower)) {
+    return (
+      header +
+      '### Modular TypeScript Implementation (Simulated)\n\n' +
+      '```typescript\n' +
+      'export function clampRetryDelay(attempt: number, baseMs = 250, maxMs = 4000): number {\n' +
+      '  const safeAttempt = Math.max(0, Math.min(attempt, 6));\n' +
+      '  return Math.min(maxMs, baseMs * Math.pow(2, safeAttempt));\n' +
+      '}\n' +
+      '```\n\n' +
+      '| Input Attempt | Computed Backoff (ms) | Bounded |\n' +
+      '| --- | --- | --- |\n' +
+      '| 0 | 250 | Yes |\n' +
+      '| 2 | 1000 | Yes |\n' +
+      '| 5 | 4000 | Capped |' +
+      calcLine
+    );
+  }
+
+  return (
+    header +
+    '### Structured Mock Synthesis\n\n' +
+    '1. **Direct Summary:** Your prompt was classified, validated against server schemas, and routed through the AURENYX VAELOR v0.2 pipeline.\n' +
+    '2. **Key Structure:** Markdown formatting, tables, syntax-highlighted code blocks, and mathematical notation ($\\sum_{i=1}^{n} x_i$) are active.\n' +
+    '3. **Switch to Live AI:** Disable **Mock Mode** in the chat toolbar to send requests to the configured server-side Gemini gateway.' +
+    calcLine
+  );
+}
+
 export class GeminiModelGateway implements ModelGateway {
   private readonly envSource: Record<string, string | undefined>;
+  private readonly responseCache = new Map<string, { text: string; modelUsed: string; expiresAt: number }>();
 
   constructor(envSource: Record<string, string | undefined> = process.env) {
     this.envSource = envSource;
@@ -156,10 +254,23 @@ export class GeminiModelGateway implements ModelGateway {
 
   public getStatus(): GatewayConfigurationStatus {
     const apiKey = this.getApiKey();
-    const primaryModel = (this.envSource.GEMINI_MODEL || DEFAULT_PRIMARY_MODEL).trim();
-    const fastModel = (this.envSource.GEMINI_FAST_MODEL || DEFAULT_FAST_MODEL).trim();
+    const primaryModel = (
+      this.envSource.VAELOR_DEFAULT_MODEL ||
+      this.envSource.GEMINI_MODEL ||
+      DEFAULT_PRIMARY_MODEL
+    ).trim();
+    const fastModel = (
+      this.envSource.VAELOR_FAST_MODEL ||
+      this.envSource.GEMINI_FAST_MODEL ||
+      DEFAULT_FAST_MODEL
+    ).trim();
     const paidModelsEnabled = this.envSource.ENABLE_PAID_MODELS === 'true';
-    const liveSearchConfigured = Boolean(this.envSource.SEARCH_API_KEY?.trim());
+    const hasExternalSearchKey = Boolean(this.envSource.SEARCH_API_KEY?.trim());
+    const groundedSearchMode: GatewayConfigurationStatus['groundedSearchMode'] = hasExternalSearchKey
+      ? 'external-search-key'
+      : apiKey
+        ? 'gemini-google-search'
+        : 'unavailable';
 
     return {
       configured: Boolean(apiKey),
@@ -167,7 +278,22 @@ export class GeminiModelGateway implements ModelGateway {
       primaryModel,
       fastModel,
       paidModelsEnabled,
-      liveSearchConfigured,
+      liveSearchConfigured: Boolean(apiKey || hasExternalSearchKey),
+      groundedSearchMode,
+      mockModeDefault: this.envSource.VAELOR_MOCK_MODE === 'true',
+    };
+  }
+
+  public async checkProviderAvailability() {
+    const status = this.getStatus();
+    return {
+      available: status.configured,
+      provider: status.provider,
+      configured: status.configured,
+      primaryModel: status.primaryModel,
+      reason: status.configured
+        ? 'Server-side GEMINI_API_KEY is configured.'
+        : 'GEMINI_API_KEY is missing on the server; configure it in Secrets/.env or use labeled Local Mock Mode for UI testing.',
     };
   }
 
@@ -179,6 +305,7 @@ export class GeminiModelGateway implements ModelGateway {
       primaryModel: status.primaryModel,
       fastModel: status.fastModel,
       paidModelsEnabled: status.paidModelsEnabled,
+      mockModeAvailable: true,
       supportsStreaming: true,
       supportsVision: true,
       supportsStructuredJson: true,
@@ -195,7 +322,7 @@ export class GeminiModelGateway implements ModelGateway {
       throw new ModelGatewayError({
         code: 'MISSING_API_KEY',
         message:
-          'Model setup required: GEMINI_API_KEY is not configured on the server. Configure it in server-side Secrets or .env (never in frontend code).',
+          'Model setup required: GEMINI_API_KEY is not configured on the server. Configure it in server-side Secrets or .env (never in frontend code), or toggle Local Mock Mode for UI testing.',
         statusCode: 503,
         retryable: false,
       });
@@ -211,6 +338,22 @@ export class GeminiModelGateway implements ModelGateway {
     });
   }
 
+  private computeCacheKey(scope: string, model: string, systemInstruction: string, turns: GatewayTurn[]): string {
+    const hash = crypto
+      .createHash('sha256')
+      .update(JSON.stringify({ scope, model, systemInstruction, turns }))
+      .digest('hex');
+    return hash;
+  }
+
+  public async generateResponse(input: AIRequest): Promise<AIResponse> {
+    return this.generate(input);
+  }
+
+  public streamResponse(input: AIRequest): AsyncIterable<{ delta: string; modelUsed: string }> {
+    return this.stream(input);
+  }
+
   public async generate(input: AIRequest): Promise<AIResponse> {
     const res = await this.generateText({
       systemInstruction: input.systemInstruction,
@@ -219,12 +362,18 @@ export class GeminiModelGateway implements ModelGateway {
       tier: input.tier,
       timeoutMs: input.timeoutMs,
       maxOutputChars: input.maxOutputChars,
+      mockMode: input.mockMode,
+      bypassCache: input.bypassCache,
+      cacheScope: input.cacheScope,
+      signal: input.signal,
     });
     const inputChars = input.messages.reduce((sum, m) => sum + m.text.length, 0);
     return {
       text: res.text,
       modelUsed: res.modelUsed,
-      provider: 'Gemini API (@google/genai)',
+      provider: res.isMockResponse ? 'Local Mock Simulator (UI Test)' : 'Gemini API (@google/genai)',
+      isMockResponse: res.isMockResponse,
+      cached: res.cached,
       usage: {
         inputChars,
         outputChars: res.text.length,
@@ -236,6 +385,18 @@ export class GeminiModelGateway implements ModelGateway {
   public async *stream(
     input: AIRequest
   ): AsyncIterable<{ delta: string; modelUsed: string }> {
+    throwIfAborted(input.signal);
+
+    if (input.mockMode) {
+      const mockText = buildExplicitLocalMockText(input.messages);
+      const chunks = mockText.match(/.{1,36}(\s|$)/gs) ?? [mockText];
+      for (const piece of chunks) {
+        throwIfAborted(input.signal);
+        yield { delta: piece, modelUsed: 'local-mock-simulator' };
+      }
+      return;
+    }
+
     const ai = this.createClient();
     const status = this.getStatus();
     const targetModel = input.tier === 'fast' ? status.fastModel : status.primaryModel;
@@ -243,20 +404,23 @@ export class GeminiModelGateway implements ModelGateway {
     const contents = buildContentsWithAttachments(input.messages, input.attachments);
 
     try {
-      const responseStream = await withGatewayTimeout(
-        ai.models.generateContentStream({
-          model: targetModel,
-          contents,
-          config: {
-            systemInstruction: input.systemInstruction,
-            temperature: input.temperature ?? 0.4,
-          },
-        }),
-        input.timeoutMs ?? DEFAULT_TIMEOUT_MS
+      const responseStream = await withRetryAndTimeout(
+        () =>
+          ai.models.generateContentStream({
+            model: targetModel,
+            contents,
+            config: {
+              systemInstruction: input.systemInstruction,
+              temperature: input.temperature ?? 0.4,
+            },
+          }),
+        input.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+        input.signal
       );
 
       let emittedChars = 0;
       for await (const chunk of responseStream) {
+        throwIfAborted(input.signal);
         const piece = chunk.text ?? '';
         if (!piece) continue;
         if (emittedChars + piece.length > maxChars) {
@@ -279,25 +443,56 @@ export class GeminiModelGateway implements ModelGateway {
   }
 
   public async generateText(req: TextGenerationRequest): Promise<TextGenerationResponse> {
+    throwIfAborted(req.signal);
+
+    if (req.mockMode) {
+      return {
+        text: buildExplicitLocalMockText(req.turns),
+        modelUsed: 'local-mock-simulator',
+        isMockResponse: true,
+      };
+    }
+
     const ai = this.createClient();
     const status = this.getStatus();
     const requestedModel = req.tier === 'fast' ? status.fastModel : status.primaryModel;
     const timeoutMs = req.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const maxChars = req.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS;
 
+    const canCache =
+      !req.bypassCache &&
+      (!req.attachments || req.attachments.length === 0) &&
+      Boolean(req.cacheScope);
+    const cacheKey = canCache
+      ? this.computeCacheKey(req.cacheScope!, requestedModel, req.systemInstruction, req.turns)
+      : '';
+
+    if (canCache && cacheKey) {
+      const hit = this.responseCache.get(cacheKey);
+      if (hit && hit.expiresAt > Date.now()) {
+        return {
+          text: hit.text,
+          modelUsed: hit.modelUsed,
+          cached: true,
+        };
+      }
+    }
+
     const contents = buildContentsWithAttachments(req.turns, req.attachments);
 
     const invokeModel = async (targetModel: string, callTimeoutMs: number) => {
-      const response = await withGatewayTimeout(
-        ai.models.generateContent({
-          model: targetModel,
-          contents,
-          config: {
-            systemInstruction: req.systemInstruction,
-            temperature: 0.4,
-          },
-        }),
-        callTimeoutMs
+      const response = await withRetryAndTimeout(
+        () =>
+          ai.models.generateContent({
+            model: targetModel,
+            contents,
+            config: {
+              systemInstruction: req.systemInstruction,
+              temperature: 0.4,
+            },
+          }),
+        callTimeoutMs,
+        req.signal
       );
 
       const rawText = response.text?.trim() ?? '';
@@ -322,15 +517,28 @@ export class GeminiModelGateway implements ModelGateway {
     };
 
     try {
-      return await invokeModel(requestedModel, timeoutMs);
+      const out = await invokeModel(requestedModel, timeoutMs);
+      if (canCache && cacheKey) {
+        if (this.responseCache.size >= MAX_CACHE_ENTRIES) {
+          const oldestKey = this.responseCache.keys().next().value;
+          if (oldestKey) this.responseCache.delete(oldestKey);
+        }
+        this.responseCache.set(cacheKey, {
+          text: out.text,
+          modelUsed: out.modelUsed,
+          expiresAt: Date.now() + 5 * 60_000,
+        });
+      }
+      return out;
     } catch (error) {
       const normalized = normalizeProviderError(error);
       if (
+        normalized.code !== 'CANCELLED' &&
         requestedModel !== status.fastModel &&
         (normalized.code === 'MODEL_UNAVAILABLE' || normalized.code === 'TIMEOUT')
       ) {
         try {
-          return await invokeModel(status.fastModel, Math.min(timeoutMs, 18_000));
+          return await invokeModel(status.fastModel, Math.min(timeoutMs, 16_000));
         } catch (fallbackErr) {
           throw normalizeProviderError(fallbackErr);
         }
@@ -339,51 +547,155 @@ export class GeminiModelGateway implements ModelGateway {
     }
   }
 
-  public async generateSentinelReview(
-    req: SentinelJsonReviewRequest
-  ): Promise<SentinelJsonReviewResponse> {
+  /**
+   * Grounded Web Search via server-side Gemini Google Search Grounding (`tools: [{ googleSearch: {} }]`).
+   * Extracts real groundingChunks (title + URI) without ever fabricating citations.
+   */
+  public async searchGroundedWeb(
+    query: string,
+    options?: { timeoutMs?: number; signal?: AbortSignal }
+  ): Promise<GroundedWebSearchResult> {
+    throwIfAborted(options?.signal);
+    const apiKey = this.getApiKey();
+    if (!apiKey) {
+      return {
+        status: 'unavailable',
+        query,
+        summaryText: '',
+        citations: [],
+        note: 'Grounded web search is unavailable because GEMINI_API_KEY is not configured on the server.',
+      };
+    }
+
     const ai = this.createClient();
     const status = this.getStatus();
-    const model = status.fastModel || status.primaryModel;
-    const timeoutMs = req.timeoutMs ?? 24_000;
+    const timeoutMs = options?.timeoutMs ?? 12_000;
 
     try {
       const response = await withGatewayTimeout(
         ai.models.generateContent({
-          model,
-          contents: req.prompt,
+          model: status.primaryModel,
+          contents: `Retrieve factual, up-to-date grounded information for the following research query and summarize key verifiable facts concisely:\n\n${query}`,
           config: {
-            systemInstruction: req.systemInstruction,
-            temperature: 0.2,
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                approved: {
-                  type: Type.BOOLEAN,
-                  description:
-                    'True if the draft fulfills the request without unsupported claims or policy breaches.',
-                },
-                flags: {
-                  type: Type.ARRAY,
-                  items: { type: Type.STRING },
-                  description: 'Specific issues or cautions identified during verification.',
-                },
-                summary: {
-                  type: Type.STRING,
-                  description: 'Concise 1-sentence verification summary.',
-                },
-                revisedAnswer: {
-                  type: Type.STRING,
-                  description:
-                    'Improved final response with any overstatements or unsupported claims corrected. Keep faithful to original if approved.',
-                },
-              },
-              required: ['approved', 'flags', 'summary', 'revisedAnswer'],
-            },
+            tools: [{ googleSearch: {} }],
+            temperature: 0.1,
           },
         }),
-        timeoutMs
+        timeoutMs,
+        options?.signal
+      );
+
+      const summaryText = (response.text ?? '').trim();
+      const rawChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
+      const seenUrls = new Set<string>();
+      const citations: CitationItem[] = [];
+
+      for (let i = 0; i < rawChunks.length; i += 1) {
+        const web = rawChunks[i]?.web;
+        const uri = web?.uri?.trim();
+        if (!uri || !/^https?:\/\//i.test(uri) || seenUrls.has(uri)) continue;
+        seenUrls.add(uri);
+        citations.push({
+          id: `cit-web-${i + 1}`,
+          sourceTitle: web?.title?.trim() || new URL(uri).hostname,
+          sourceType: 'web',
+          url: uri,
+          excerpt: summaryText
+            ? `${summaryText.slice(0, 200)}${summaryText.length > 200 ? '…' : ''} (${uri})`
+            : uri,
+        });
+        if (citations.length >= 6) break;
+      }
+
+      if (citations.length === 0) {
+        return {
+          status: 'no_sources',
+          query,
+          summaryText,
+          citations: [],
+          note: 'Search grounding completed, but no verifiable external web source URLs were returned for this query.',
+        };
+      }
+
+      return {
+        status: 'ok',
+        query,
+        summaryText,
+        citations,
+        note: `Retrieved ${citations.length} grounded web source(s) via Gemini Google Search.`,
+      };
+    } catch (error) {
+      const normalized = normalizeProviderError(error);
+      if (normalized.code === 'CANCELLED') throw normalized;
+      return {
+        status: 'unavailable',
+        query,
+        summaryText: '',
+        citations: [],
+        note: `Live web search grounding could not be completed (${normalized.code}): ${normalized.message}`,
+      };
+    }
+  }
+
+  public async generateSentinelReview(
+    req: SentinelJsonReviewRequest
+  ): Promise<SentinelJsonReviewResponse> {
+    throwIfAborted(req.signal);
+
+    if (req.mockMode) {
+      return {
+        approved: true,
+        flags: [],
+        summary: 'Local Mock Mode: Deterministic Sentinel safety checks passed (LLM critic skipped in mock mode).',
+        revisedAnswer: '',
+        modelUsed: 'local-mock-simulator',
+      };
+    }
+
+    const ai = this.createClient();
+    const status = this.getStatus();
+    const model = status.fastModel || status.primaryModel;
+    const timeoutMs = req.timeoutMs ?? 18_000;
+
+    try {
+      const response = await withRetryAndTimeout(
+        () =>
+          ai.models.generateContent({
+            model,
+            contents: req.prompt,
+            config: {
+              systemInstruction: req.systemInstruction,
+              temperature: 0.2,
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  approved: {
+                    type: Type.BOOLEAN,
+                    description:
+                      'True if the draft fulfills the request without unsupported claims or policy breaches.',
+                  },
+                  flags: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING },
+                    description: 'Specific issues or cautions identified during verification.',
+                  },
+                  summary: {
+                    type: Type.STRING,
+                    description: 'Concise 1-sentence verification summary.',
+                  },
+                  revisedAnswer: {
+                    type: Type.STRING,
+                    description:
+                      'Improved final response with any overstatements or unsupported claims corrected. Keep faithful to original if approved.',
+                  },
+                },
+                required: ['approved', 'flags', 'summary', 'revisedAnswer'],
+              },
+            },
+          }),
+        timeoutMs,
+        req.signal
       );
 
       const jsonText = response.text?.trim() ?? '';
@@ -514,9 +826,112 @@ function mapSupportedAspectRatio(ratio: ImageAspectRatio): string {
   return '1:1';
 }
 
-async function withGatewayTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw new ModelGatewayError({
+      code: 'CANCELLED',
+      message: 'Generation stopped by user.',
+      statusCode: 499,
+      retryable: false,
+    });
+  }
+}
+
+async function withRetryAndTimeout<T>(
+  operation: () => Promise<T>,
+  timeoutMs: number,
+  signal?: AbortSignal,
+  maxRetries = 1
+): Promise<T> {
+  let attempt = 0;
+  while (true) {
+    throwIfAborted(signal);
+    try {
+      return await withGatewayTimeout(operation(), timeoutMs, signal);
+    } catch (err) {
+      const normalized = normalizeProviderError(err);
+      if (
+        attempt >= maxRetries ||
+        normalized.code === 'CANCELLED' ||
+        normalized.code === 'MISSING_API_KEY' ||
+        normalized.code === 'INVALID_API_KEY' ||
+        normalized.code === 'QUOTA_EXCEEDED' ||
+        normalized.code === 'PAID_TIER_REQUIRED'
+      ) {
+        throw normalized;
+      }
+      attempt += 1;
+      const delayMs = Math.min(1200, 280 * Math.pow(2, attempt - 1));
+      await sleepWithAbort(delayMs, signal);
+    }
+  }
+}
+
+function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(
+        new ModelGatewayError({
+          code: 'CANCELLED',
+          message: 'Generation stopped by user.',
+          statusCode: 499,
+          retryable: false,
+        })
+      );
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(
+        new ModelGatewayError({
+          code: 'CANCELLED',
+          message: 'Generation stopped by user.',
+          statusCode: 499,
+          retryable: false,
+        })
+      );
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+async function withGatewayTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  signal?: AbortSignal
+): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+  let onAbort: (() => void) | undefined;
+
+  const raceGuards = new Promise<never>((_resolve, reject) => {
+    if (signal?.aborted) {
+      reject(
+        new ModelGatewayError({
+          code: 'CANCELLED',
+          message: 'Generation stopped by user.',
+          statusCode: 499,
+          retryable: false,
+        })
+      );
+      return;
+    }
+
+    onAbort = () => {
+      reject(
+        new ModelGatewayError({
+          code: 'CANCELLED',
+          message: 'Generation stopped by user.',
+          statusCode: 499,
+          retryable: false,
+        })
+      );
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+
     timer = setTimeout(() => {
       reject(
         new ModelGatewayError({
@@ -530,9 +945,10 @@ async function withGatewayTimeout<T>(promise: Promise<T>, timeoutMs: number): Pr
   });
 
   try {
-    return await Promise.race([promise, timeoutPromise]);
+    return await Promise.race([promise, raceGuards]);
   } finally {
     if (timer) clearTimeout(timer);
+    if (onAbort && signal) signal.removeEventListener('abort', onAbort);
   }
 }
 
@@ -544,6 +960,15 @@ export function normalizeProviderError(error: unknown): ModelGatewayError {
   const rawMsg = error instanceof Error ? error.message : String(error ?? '');
   const lower = rawMsg.toLowerCase();
 
+  if (error instanceof DOMException && error.name === 'AbortError') {
+    return new ModelGatewayError({
+      code: 'CANCELLED',
+      message: 'Generation stopped by user.',
+      statusCode: 499,
+      retryable: false,
+    });
+  }
+
   if (
     lower.includes('429') ||
     lower.includes('quota') ||
@@ -552,7 +977,8 @@ export function normalizeProviderError(error: unknown): ModelGatewayError {
   ) {
     return new ModelGatewayError({
       code: 'QUOTA_EXCEEDED',
-      message: 'Provider free-tier quota or rate limit reached. Wait a moment and retry.',
+      message:
+        'Provider free-tier quota or rate limit reached (HTTP 429). Wait a moment and retry, or enable Local Mock Mode for UI testing.',
       statusCode: 429,
       retryable: true,
     });
@@ -569,7 +995,7 @@ export function normalizeProviderError(error: unknown): ModelGatewayError {
     return new ModelGatewayError({
       code: 'INVALID_API_KEY',
       message:
-        'The model provider rejected the server API key or model access. Verify GEMINI_API_KEY and GEMINI_MODEL on the backend.',
+        'The model provider rejected the server API key or model access. Verify GEMINI_API_KEY and VAELOR_DEFAULT_MODEL in Settings > Secrets.',
       statusCode: 502,
       retryable: false,
     });
@@ -580,12 +1006,13 @@ export function normalizeProviderError(error: unknown): ModelGatewayError {
     lower.includes('not found') ||
     lower.includes('not supported') ||
     lower.includes('503') ||
-    lower.includes('unavailable')
+    lower.includes('unavailable') ||
+    lower.includes('overloaded')
   ) {
     return new ModelGatewayError({
       code: 'MODEL_UNAVAILABLE',
       message:
-        'The configured Gemini model is temporarily unavailable or unsupported on this tier. Check GEMINI_MODEL in server configuration.',
+        'The configured Gemini model is temporarily overloaded or unavailable on this free tier (HTTP 503). Retry shortly or use Local Mock Mode for UI testing.',
       statusCode: 503,
       retryable: true,
     });

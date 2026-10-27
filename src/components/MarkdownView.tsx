@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import katex from 'katex';
 import { Check, Copy, Download } from 'lucide-react';
 
 interface MarkdownViewProps {
@@ -6,9 +7,28 @@ interface MarkdownViewProps {
 }
 
 interface ContentSegment {
-  type: 'text' | 'code';
+  type: 'text' | 'code' | 'math-block';
   lang?: string;
   value: string;
+}
+
+function splitMathBlocks(textChunk: string): ContentSegment[] {
+  const out: ContentSegment[] = [];
+  const blockMathRegex = /\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]/g;
+  let lastIdx = 0;
+  let m: RegExpExecArray | null;
+  while ((m = blockMathRegex.exec(textChunk)) !== null) {
+    if (m.index > lastIdx) {
+      out.push({ type: 'text', value: textChunk.slice(lastIdx, m.index) });
+    }
+    const expr = (m[1] ?? m[2] ?? '').trim();
+    out.push({ type: 'math-block', value: expr });
+    lastIdx = m.index + m[0].length;
+  }
+  if (lastIdx < textChunk.length) {
+    out.push({ type: 'text', value: textChunk.slice(lastIdx) });
+  }
+  return out;
 }
 
 function splitCodeFences(raw: string): ContentSegment[] {
@@ -19,7 +39,7 @@ function splitCodeFences(raw: string): ContentSegment[] {
 
   while ((match = fenceRegex.exec(raw)) !== null) {
     if (match.index > lastIndex) {
-      segments.push({ type: 'text', value: raw.slice(lastIndex, match.index) });
+      segments.push(...splitMathBlocks(raw.slice(lastIndex, match.index)));
     }
     segments.push({
       type: 'code',
@@ -30,10 +50,23 @@ function splitCodeFences(raw: string): ContentSegment[] {
   }
 
   if (lastIndex < raw.length) {
-    segments.push({ type: 'text', value: raw.slice(lastIndex) });
+    segments.push(...splitMathBlocks(raw.slice(lastIndex)));
   }
 
   return segments;
+}
+
+function renderSafeMathHtml(expr: string, displayMode: boolean): string {
+  try {
+    return katex.renderToString(expr, {
+      displayMode,
+      throwOnError: false,
+      trust: false,
+      output: 'mathml',
+    });
+  } catch {
+    return '';
+  }
 }
 
 const KEYWORD_SET = new Set([
@@ -189,8 +222,11 @@ const CodeBlock: React.FC<{ lang: string; code: string }> = ({ lang, code }) => 
 };
 
 function renderInlineFormatting(line: string): React.ReactNode[] {
-  const tokens = line.split(/(`[^`]+`|\*\*[^*]+\*\*)/g);
+  const inlinePattern =
+    /(`[^`]+`|\[[^\]]+\]\(https?:\/\/[^\s)]+\)|\\\([^\n]+?\\\)|\$(?!\s)(?:[A-Za-z\\{(]|[^$\n]{1,120}?[\\^_=+\-*/{}])[^$\n]{0,120}?(?<!\s)\$|\*\*[^*]+\*\*|(?<!\*)\*(?!\s|\*)[^*\n]+?(?<!\s|\*)\*(?!\*))/g;
+  const tokens = line.split(inlinePattern);
   return tokens.map((token, idx) => {
+    if (!token) return null;
     if (token.startsWith('`') && token.endsWith('`') && token.length >= 2) {
       return (
         <code
@@ -201,11 +237,53 @@ function renderInlineFormatting(line: string): React.ReactNode[] {
         </code>
       );
     }
+    const linkMatch = token.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/);
+    if (linkMatch) {
+      return (
+        <a
+          key={idx}
+          href={linkMatch[2]}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-[#bca8fc] underline underline-offset-2 hover:text-white break-all"
+        >
+          {linkMatch[1]}
+        </a>
+      );
+    }
+    if (
+      (token.startsWith('\\(') && token.endsWith('\\)')) ||
+      (token.startsWith('$') && token.endsWith('$') && token.length >= 3)
+    ) {
+      const expr = token.startsWith('\\(') ? token.slice(2, -2).trim() : token.slice(1, -1).trim();
+      const mathHtml = renderSafeMathHtml(expr, false);
+      if (mathHtml) {
+        return (
+          <span
+            key={idx}
+            className="inline-block align-middle text-[#f2effb] px-0.5"
+            dangerouslySetInnerHTML={{ __html: mathHtml }}
+          />
+        );
+      }
+    }
     if (token.startsWith('**') && token.endsWith('**') && token.length >= 4) {
       return (
         <strong key={idx} className="font-semibold text-[#f6f4fc]">
           {token.slice(2, -2)}
         </strong>
+      );
+    }
+    if (
+      token.startsWith('*') &&
+      token.endsWith('*') &&
+      !token.startsWith('**') &&
+      token.length >= 3
+    ) {
+      return (
+        <em key={idx} className="italic text-[#cfc9e6]">
+          {renderInlineFormatting(token.slice(1, -1))}
+        </em>
       );
     }
     return <React.Fragment key={idx}>{token}</React.Fragment>;
@@ -283,6 +361,30 @@ function renderTextBlocks(textValue: string): React.ReactNode[] {
       continue;
     }
 
+    // Group consecutive Markdown blockquote lines (> ...) into a clean subtle callout container
+    if (line.trimStart().startsWith('>')) {
+      const quoteLines: string[] = [];
+      while (i < lines.length && (lines[i] ?? '').trimStart().startsWith('>')) {
+        quoteLines.push((lines[i] ?? '').trimStart().replace(/^>\s?/, ''));
+        i += 1;
+      }
+      nodes.push(
+        <blockquote
+          key={`bq-${i}`}
+          className="my-2 space-y-1 rounded-xl border border-white/10 bg-[#141120] px-3.5 py-2.5 text-xs leading-relaxed text-[#cfc9e6]"
+        >
+          {quoteLines.map((ql, qIdx) =>
+            ql.trim() ? (
+              <p key={qIdx}>{renderInlineFormatting(ql)}</p>
+            ) : (
+              <div key={qIdx} className="h-1" />
+            )
+          )}
+        </blockquote>
+      );
+      continue;
+    }
+
     if (!line.trim()) {
       nodes.push(<div key={`sp-${i}`} className="h-1" />);
     } else if (line.startsWith('### ')) {
@@ -344,6 +446,23 @@ export const MarkdownView: React.FC<MarkdownViewProps> = ({ content }) => {
       {segments.map((seg, idx) => {
         if (seg.type === 'code') {
           return <CodeBlock key={idx} lang={seg.lang || 'text'} code={seg.value} />;
+        }
+        if (seg.type === 'math-block') {
+          const mathHtml = renderSafeMathHtml(seg.value, true);
+          return mathHtml ? (
+            <div
+              key={idx}
+              className="my-3 overflow-x-auto rounded-xl border border-white/10 bg-[#12101c] px-4 py-3 text-center text-[#f4f1fc]"
+              dangerouslySetInnerHTML={{ __html: mathHtml }}
+            />
+          ) : (
+            <pre
+              key={idx}
+              className="my-3 overflow-x-auto rounded-xl border border-white/10 bg-[#12101c] p-3 font-mono text-xs text-[#e6e1f4]"
+            >
+              {seg.value}
+            </pre>
+          );
         }
         return (
           <div key={idx} className="space-y-2">

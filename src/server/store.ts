@@ -49,10 +49,10 @@ export function chunkDocumentText(text: string, maxChunkSize = 900): DocumentChu
   return chunks;
 }
 
-const STARTER_ARCHITECTURE_DOC = `AURENYX VAELOR 0.1 — System Architecture & Security Reference
+const STARTER_ARCHITECTURE_DOC = `AURENYX VAELOR 0.2 — System Architecture & Security Reference
 
 1. Mission & Design Boundaries
-Aurenyx Vaelor ("Intelligence, Orchestrated.") is a modular multi-agent AI assistant workspace built for ₹0 free-tier operation. It coordinates four specialist roles—Aurenyx Research, Vaelor Forge, Vaelor Knowledge, and Vaelor Sentinel—alongside Vaelor Core.
+Aurenyx Vaelor ("Intelligence, Orchestrated.") is a modular multi-agent AI assistant workspace built for ₹0 free-tier operation. It coordinates specialist roles—Aurenyx Research, Vaelor Forge, Vaelor Analyst, Vaelor Knowledge, and Vaelor Sentinel—alongside Vaelor Core.
 
 2. Bounded Orchestration Ceiling
 Every incoming user request is validated with Zod schemas on the server, rate-limited per client IP, and executed under a hard maximum ceiling of 4 model calls per request. Agents cannot self-grant permissions or invoke unregistered tools.
@@ -83,9 +83,9 @@ export class EphemeralSessionStore {
     const nowIso = new Date().toISOString();
     this.projects.push({
       id: 'proj_vaelor_01',
-      name: 'Aurenyx Vaelor 0.1 Core',
+      name: 'Aurenyx Vaelor 0.2 Core',
       objective:
-        'Validate bounded multi-agent orchestration, server-side Gemini gateway security, and Android-installable PWA readiness on a ₹0 budget.',
+        'Validate bounded multi-agent orchestration, schema-validated tool execution, server-side Gemini gateway security, and Android-installable PWA readiness on a ₹0 budget.',
       category: 'software',
       status: 'active',
       createdAt: nowIso,
@@ -95,13 +95,100 @@ export class EphemeralSessionStore {
     this.documents.push({
       id: 'doc_vaelor_arch',
       title: 'Aurenyx Vaelor 0.1 Architecture & Security Brief',
-      fileName: 'vaelor-architecture-0.1.md',
+      fileName: 'vaelor-architecture-0.2.md',
       sourceKind: 'starter',
       charCount: STARTER_ARCHITECTURE_DOC.length,
       wordCount: STARTER_ARCHITECTURE_DOC.split(/\s+/).filter(Boolean).length,
       chunks,
       createdAt: nowIso,
     });
+  }
+
+  /**
+   * Session-isolated conversation storage (prevents cross-user access across session tokens).
+   */
+  public listConversationsForOwner(ownerSessionId: string): Conversation[] {
+    return this.conversations.filter((c) => c.ownerSessionId === ownerSessionId);
+  }
+
+  public getConversationForOwner(
+    ownerSessionId: string,
+    conversationId: string
+  ): 'not_found' | 'forbidden' | Conversation {
+    const found = this.conversations.find((c) => c.id === conversationId);
+    if (!found) return 'not_found';
+    if (found.ownerSessionId && found.ownerSessionId !== ownerSessionId) {
+      return 'forbidden';
+    }
+    return found;
+  }
+
+  public upsertConversationForOwner(
+    ownerSessionId: string,
+    convInput: Omit<Conversation, 'ownerSessionId'>
+  ): 'forbidden' | Conversation {
+    const existingIdx = this.conversations.findIndex((c) => c.id === convInput.id);
+    if (existingIdx >= 0) {
+      const existing = this.conversations[existingIdx];
+      if (existing.ownerSessionId && existing.ownerSessionId !== ownerSessionId) {
+        return 'forbidden';
+      }
+      const updated: Conversation = {
+        ...existing,
+        ...convInput,
+        ownerSessionId,
+        updatedAt: convInput.updatedAt || new Date().toISOString(),
+      };
+      this.conversations[existingIdx] = updated;
+      return updated;
+    }
+
+    const nowIso = new Date().toISOString();
+    const created: Conversation = {
+      ...convInput,
+      ownerSessionId,
+      createdAt: convInput.createdAt || nowIso,
+      updatedAt: convInput.updatedAt || nowIso,
+    };
+    this.conversations.unshift(created);
+    if (this.conversations.length > 200) {
+      this.conversations = this.conversations.slice(0, 200);
+    }
+    return created;
+  }
+
+  public patchConversationForOwner(
+    ownerSessionId: string,
+    conversationId: string,
+    patch: { title?: string; archived?: boolean }
+  ): 'not_found' | 'forbidden' | Conversation {
+    const existingIdx = this.conversations.findIndex((c) => c.id === conversationId);
+    if (existingIdx < 0) return 'not_found';
+    const existing = this.conversations[existingIdx];
+    if (existing.ownerSessionId && existing.ownerSessionId !== ownerSessionId) {
+      return 'forbidden';
+    }
+    const updated: Conversation = {
+      ...existing,
+      title: patch.title !== undefined ? patch.title : existing.title,
+      archived: patch.archived !== undefined ? patch.archived : existing.archived,
+      updatedAt: new Date().toISOString(),
+    };
+    this.conversations[existingIdx] = updated;
+    return updated;
+  }
+
+  public deleteConversationForOwner(
+    ownerSessionId: string,
+    conversationId: string
+  ): 'not_found' | 'forbidden' | 'deleted' {
+    const existing = this.conversations.find((c) => c.id === conversationId);
+    if (!existing) return 'not_found';
+    if (existing.ownerSessionId && existing.ownerSessionId !== ownerSessionId) {
+      return 'forbidden';
+    }
+    this.conversations = this.conversations.filter((c) => c.id !== conversationId);
+    return 'deleted';
   }
 
   public addProject(input: Omit<ProjectWorkspace, 'id' | 'createdAt' | 'status'>): ProjectWorkspace {
@@ -175,9 +262,18 @@ export class EphemeralSessionStore {
     }
   }
 
-  public clearScope(scope: 'conversations' | 'memories' | 'documents' | 'tasks' | 'all'): void {
+  public clearScope(
+    scope: 'conversations' | 'memories' | 'documents' | 'tasks' | 'all',
+    ownerSessionId?: string
+  ): void {
     if (scope === 'conversations' || scope === 'all') {
-      this.conversations = [];
+      if (ownerSessionId) {
+        this.conversations = this.conversations.filter(
+          (c) => c.ownerSessionId && c.ownerSessionId !== ownerSessionId
+        );
+      } else {
+        this.conversations = [];
+      }
     }
     if (scope === 'memories' || scope === 'all') {
       this.memories = [];
@@ -188,7 +284,7 @@ export class EphemeralSessionStore {
     if (scope === 'tasks' || scope === 'all') {
       this.taskRuns = [];
     }
-    if (scope === 'all') {
+    if (scope === 'all' && !ownerSessionId) {
       this.projects = [];
     }
   }

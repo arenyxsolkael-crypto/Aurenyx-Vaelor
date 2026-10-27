@@ -1,6 +1,7 @@
 export const OFFICIAL_ATTRIBUTION = {
   productName: 'AURENYX VAELOR',
-  version: '0.1',
+  version: '0.2',
+  releaseTitle: 'Universal Chat Engine v1.0 · The Intelligence Expansion',
   tagline: 'Intelligence, Orchestrated.',
   category: 'General-Purpose AI Assistant and Intelligent Workflow Platform',
   founderOrganization: 'The Aether Vanguard',
@@ -19,15 +20,34 @@ export type AgentId =
   | 'vaelor-core'
   | 'aurenyx-research'
   | 'vaelor-forge'
+  | 'vaelor-analyst'
   | 'vaelor-knowledge'
   | 'vaelor-sentinel';
 
 export type TaskType =
   | 'general'
-  | 'research'
+  | 'reasoning'
+  | 'tutoring'
   | 'coding'
+  | 'research'
+  | 'writing'
+  | 'analysis'
+  | 'structured_data'
   | 'knowledge'
-  | 'verification';
+  | 'creative'
+  | 'relationship_health_edu'
+  | 'verification'
+  | 'tool_assisted';
+
+export type ResponseTone = 'balanced' | 'professional' | 'friendly' | 'academic' | 'direct';
+
+export type ResponseLength = 'concise' | 'standard' | 'detailed';
+
+export type SentinelVerificationStatus =
+  | 'verified_evidence'
+  | 'partially_verified'
+  | 'unverified'
+  | 'verification_unavailable';
 
 export type ExecutionStatus =
   | 'queued'
@@ -48,6 +68,7 @@ export type ToolName =
   | 'text_summarizer'
   | 'text_transformer'
   | 'json_validator'
+  | 'structured_formatter'
   | 'task_planner'
   | 'document_processor'
   | 'csv_analyzer'
@@ -84,6 +105,9 @@ export interface ToolSummaryMetadata {
   description: string;
   allowedAgents: AgentId[];
   timeoutMs: number;
+  maxCallsPerTask?: number;
+  errorStrategy?: string;
+  outputSchemaSummary?: string;
   resultFormat: string;
   setupGuide?: string;
 }
@@ -101,8 +125,9 @@ export interface ToolCallRecord {
 export interface CitationItem {
   id: string;
   sourceTitle: string;
-  sourceType: 'document' | 'memory' | 'tool';
+  sourceType: 'document' | 'memory' | 'tool' | 'web';
   excerpt: string;
+  url?: string;
   documentId?: string;
   chunkIndex?: number;
 }
@@ -110,9 +135,24 @@ export interface CitationItem {
 export interface SentinelReview {
   approved: boolean;
   status: 'verified' | 'flagged' | 'skipped';
+  verificationStatus?: SentinelVerificationStatus;
+  verificationLabel?: string;
   flags: string[];
   summary: string;
   revised: boolean;
+}
+
+export interface TaskPlanRecord {
+  goal: string;
+  detectedCategories: TaskType[];
+  selectedAgent: AgentId;
+  requiresTools: boolean;
+  permittedTools: ToolName[];
+  selectedTools: ToolName[];
+  isMultiStep: boolean;
+  requiresExternalEvidence: boolean;
+  completionCriteria: string;
+  plannerSource: 'deterministic-schema' | 'fallback-direct';
 }
 
 export interface TaskErrorInfo {
@@ -124,6 +164,8 @@ export interface TaskErrorInfo {
 export interface StructuredTaskRun {
   taskId: string;
   taskType: TaskType;
+  detectedCategories?: TaskType[];
+  taskPlan?: TaskPlanRecord;
   userRequest: string;
   selectedAgent: AgentId;
   agentName: string;
@@ -137,12 +179,21 @@ export interface StructuredTaskRun {
   sentinelReview?: SentinelReview;
   promptInjectionFlagged: boolean;
   researchMode?: boolean;
+  webSearchUsed?: boolean;
+  tone?: ResponseTone;
+  responseLength?: ResponseLength;
+  mockMode?: boolean;
+  isMockResponse?: boolean;
+  contextTruncated?: boolean;
+  totalHistoryTurns?: number;
+  policyAction?: 'allowed' | 'educational_safe_framing' | 'refused_prohibited';
   attachmentNames?: string[];
   result?: string;
   modelUsed?: string;
   error?: TaskErrorInfo;
   projectId?: string;
   conversationId?: string;
+  ownerSessionId?: string;
   createdAt: string;
   durationMs: number;
 }
@@ -152,6 +203,7 @@ export interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
   createdAt: string;
+  editedAt?: string;
   agentId?: AgentId;
   agentName?: string;
   taskRun?: StructuredTaskRun;
@@ -160,12 +212,15 @@ export interface ChatMessage {
   generatedSvgBlueprint?: string;
   attachments?: Pick<ChatAttachment, 'id' | 'name' | 'mimeType' | 'kind' | 'sizeBytes'>[];
   isStreaming?: boolean;
+  isMockResponse?: boolean;
 }
 
 export interface Conversation {
   id: string;
   title: string;
   projectId?: string;
+  archived?: boolean;
+  ownerSessionId?: string;
   messages: ChatMessage[];
   createdAt: string;
   updatedAt: string;
@@ -219,12 +274,18 @@ export interface AIRequest {
   temperature?: number;
   timeoutMs?: number;
   maxOutputChars?: number;
+  mockMode?: boolean;
+  bypassCache?: boolean;
+  cacheScope?: string;
+  signal?: AbortSignal;
 }
 
 export interface AIResponse {
   text: string;
   modelUsed: string;
   provider: string;
+  isMockResponse?: boolean;
+  cached?: boolean;
   usage: UsageMetadata;
 }
 
@@ -245,6 +306,7 @@ export interface ModelCapabilities {
   primaryModel: string;
   fastModel: string;
   paidModelsEnabled: boolean;
+  mockModeAvailable: boolean;
   supportsStreaming: boolean;
   supportsVision: boolean;
   supportsStructuredJson: boolean;
@@ -264,12 +326,15 @@ export interface WorkflowState {
 
 export interface HealthResponse {
   ok: boolean;
+  version?: string;
   configured: boolean;
   provider: string;
   primaryModel?: string;
   fastModel?: string;
   paidModelsEnabled: boolean;
   liveSearchConfigured?: boolean;
+  groundedSearchMode?: 'gemini-google-search' | 'external-search-key' | 'unavailable';
+  mockModeDefault?: boolean;
   maxStepsPerRequest: number;
   rateLimitPerMinute: number;
   storageMode: 'in-memory-ephemeral';
@@ -311,7 +376,8 @@ export interface EvaluationPromptCase {
     | 'calculator'
     | 'verification'
     | 'security'
-    | 'validation';
+    | 'validation'
+    | 'education';
   title: string;
   prompt: string;
   expectedBehavior: string;

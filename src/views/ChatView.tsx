@@ -12,12 +12,16 @@ import {
   Compass,
   Copy,
   Download,
+  ExternalLink,
   FileText,
+  FlaskConical,
   Frame,
   Layers,
   Mic,
   MicOff,
   Paperclip,
+  Pencil,
+  RefreshCw,
   RotateCcw,
   ShieldAlert,
   ShieldCheck,
@@ -36,6 +40,8 @@ import {
   type ChatMessage,
   type ImageAspectRatio,
   type ImageResolutionSize,
+  type ResponseLength,
+  type ResponseTone,
 } from '../shared/types';
 
 const SUGGESTED_PROMPTS = [
@@ -109,14 +115,22 @@ interface BrowserSpeechRecognition {
 
 const MessageItem: React.FC<{
   message: ChatMessage;
+  isSending: boolean;
   onRetry: (prompt: string) => void;
-}> = ({ message, onRetry }) => {
+  onEditUserPrompt: (messageId: string, newContent: string) => void;
+  onRegenerate: (assistantMessageId: string) => void;
+}> = ({ message, isSending, onRetry, onEditUserPrompt, onRegenerate }) => {
   const [copied, setCopied] = useState(false);
   const [traceExpanded, setTraceExpanded] = useState(false);
   const [toolsExpanded, setToolsExpanded] = useState(false);
+  const [isEditing, setIsEditing] = useState(false);
+  const [editDraft, setEditDraft] = useState(message.content);
 
   const isUser = message.role === 'user';
   const run = message.taskRun;
+  const completedToolsCount = run
+    ? run.toolCalls.filter((t) => t.status === 'completed').length
+    : 0;
   const timeStr = new Date(message.createdAt).toLocaleTimeString([], {
     hour: '2-digit',
     minute: '2-digit',
@@ -136,6 +150,14 @@ const MessageItem: React.FC<{
     a.download = `vaelor-response-${message.id}.md`;
     a.click();
     URL.revokeObjectURL(url);
+  };
+
+  const handleSaveEdit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleaned = editDraft.trim();
+    if (!cleaned || isSending) return;
+    setIsEditing(false);
+    onEditUserPrompt(message.id, cleaned);
   };
 
   return (
@@ -160,10 +182,24 @@ const MessageItem: React.FC<{
             <span aria-hidden="true">·</span>
             <span className="font-mono tabular-nums">{timeStr}</span>
 
+            {isUser && message.editedAt && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span className="text-[#a59ec0]">edited</span>
+              </>
+            )}
+
             {message.isStreaming && (
               <>
                 <span aria-hidden="true">·</span>
                 <span className="text-[#a58ff8]">Streaming response…</span>
+              </>
+            )}
+
+            {!isUser && (message.isMockResponse || run?.isMockResponse) && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span className="text-amber-300 font-medium">Simulated (Mock Mode)</span>
               </>
             )}
 
@@ -175,34 +211,61 @@ const MessageItem: React.FC<{
                 </span>
                 <span aria-hidden="true">·</span>
                 <span className="font-mono tabular-nums">{run.durationMs} ms</span>
-                {run.sentinelReview && (
+                {run.webSearchUsed && (
                   <>
+                    <span aria-hidden="true">·</span>
+                    <span className="text-[#8ad8ff]">Web search grounded</span>
+                  </>
+                )}
+                {completedToolsCount > 0 && (
+                  <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
+                    <span aria-hidden="true">·</span>
+                    <span className="text-[#c5b3fc]">
+                      {`${completedToolsCount} ${completedToolsCount === 1 ? 'tool' : 'tools'} executed`}
+                    </span>
+                  </span>
+                )}
+                {run.sentinelReview && (
+                  <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
                     <span aria-hidden="true">·</span>
                     <span
                       className={`inline-flex items-center gap-1 ${
-                        run.sentinelReview.status === 'flagged'
+                        run.sentinelReview.status === 'flagged' ||
+                        run.sentinelReview.verificationStatus === 'unverified'
                           ? 'text-amber-300'
-                          : 'text-emerald-300'
+                          : run.sentinelReview.verificationStatus === 'verification_unavailable'
+                            ? 'text-[#b5add0]'
+                            : 'text-emerald-300'
                       }`}
                     >
-                      {run.sentinelReview.status === 'flagged' ? (
+                      {run.sentinelReview.status === 'flagged' ||
+                      run.sentinelReview.verificationStatus === 'unverified' ? (
                         <ShieldAlert className="h-3.5 w-3.5" />
                       ) : (
                         <ShieldCheck className="h-3.5 w-3.5" />
                       )}
                       <span>
-                        {run.sentinelReview.status === 'flagged'
-                          ? 'Sentinel flagged'
-                          : run.sentinelReview.status === 'verified'
-                            ? 'Sentinel reviewed'
-                            : 'Deterministic check'}
+                        {run.sentinelReview.verificationLabel ||
+                          (run.sentinelReview.status === 'flagged'
+                            ? 'Unverified'
+                            : run.sentinelReview.status === 'verified'
+                              ? 'Partially verified'
+                              : 'Verification unavailable')}
                       </span>
                     </span>
-                  </>
+                  </span>
                 )}
               </>
             )}
           </div>
+
+          {/* Context Window Truncation Notice (shown truthfully ONLY when >8 prior turns were trimmed) */}
+          {!isUser && run?.contextTruncated && (
+            <p className="text-[11px] text-[#968fa9]">
+              Context window notice: Grounded on the 8 most recent turns (out of{' '}
+              {run.totalHistoryTurns ?? 9} prior messages) to preserve latency and ₹0 token limits.
+            </p>
+          )}
 
           {/* Attached File Metadata */}
           {message.attachments && message.attachments.length > 0 && (
@@ -214,8 +277,41 @@ const MessageItem: React.FC<{
             </div>
           )}
 
-          {/* Message Body or Error State */}
-          {message.error ? (
+          {/* Message Body, Inline Prompt Editor, or Error State */}
+          {isUser && isEditing ? (
+            <form onSubmit={handleSaveEdit} className="space-y-2 rounded-xl border border-[#8b6ff7]/40 bg-[#141220] p-3">
+              <label htmlFor={`edit-prompt-${message.id}`} className="sr-only">
+                Edit user prompt
+              </label>
+              <textarea
+                id={`edit-prompt-${message.id}`}
+                rows={3}
+                maxLength={8000}
+                value={editDraft}
+                onChange={(e) => setEditDraft(e.target.value)}
+                className="w-full resize-y rounded-lg border border-white/10 bg-[#0e0c16] p-2.5 text-sm text-[#f5f3fc] focus:border-[#8b6ff7] focus:outline-none"
+              />
+              <div className="flex items-center gap-2">
+                <button
+                  type="submit"
+                  disabled={!editDraft.trim() || isSending}
+                  className="min-h-[36px] rounded-lg bg-[#8b6ff7] px-3 py-1.5 text-xs font-semibold text-[#0b0a10] hover:bg-[#9f86fa] disabled:opacity-45"
+                >
+                  Save &amp; Submit
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsEditing(false);
+                    setEditDraft(message.content);
+                  }}
+                  className="min-h-[36px] rounded-lg border border-white/12 bg-[#0e0c16] px-3 py-1.5 text-xs text-[#cfc8e2] hover:text-white"
+                >
+                  Cancel
+                </button>
+              </div>
+            </form>
+          ) : message.error ? (
             <div className="rounded-xl border border-rose-500/30 bg-rose-950/25 p-4 text-sm text-rose-200">
               <div className="flex items-start gap-2.5">
                 <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-400" />
@@ -243,6 +339,38 @@ const MessageItem: React.FC<{
             />
           )}
 
+          {/* User Message Controls: Edit prompt & Copy */}
+          {isUser && !isEditing && (
+            <div className="flex flex-wrap items-center gap-2 pt-0.5">
+              <button
+                type="button"
+                disabled={isSending}
+                onClick={() => {
+                  setEditDraft(message.content);
+                  setIsEditing(true);
+                }}
+                aria-label="Edit prompt"
+                className="inline-flex min-h-[34px] items-center gap-1.5 rounded-lg border border-white/8 bg-[#13111d] px-2.5 py-1 text-xs text-[#b5add0] hover:border-white/20 hover:text-white disabled:opacity-45"
+              >
+                <Pencil className="h-3 w-3" />
+                <span>Edit prompt</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleCopy}
+                aria-label="Copy prompt"
+                className="inline-flex min-h-[34px] items-center gap-1.5 rounded-lg border border-white/8 bg-[#13111d] px-2.5 py-1 text-xs text-[#b5add0] hover:border-white/20 hover:text-white"
+              >
+                {copied ? (
+                  <Check className="h-3 w-3 text-emerald-400" />
+                ) : (
+                  <Copy className="h-3 w-3" />
+                )}
+                <span>{copied ? 'Copied' : 'Copy'}</span>
+              </button>
+            </div>
+          )}
+
           {/* Optional SVG Chart or Architectural Blueprint Preview */}
           {message.generatedSvgBlueprint && (
             <div className="mt-3 overflow-hidden rounded-xl border border-white/10 bg-[#0d0b14] p-3">
@@ -257,10 +385,10 @@ const MessageItem: React.FC<{
             </div>
           )}
 
-          {/* Grounded Citations */}
+          {/* Grounded Sources & Evidence Panel (Web URLs + Indexed Documents) */}
           {!isUser && run && run.citations.length > 0 && (
             <div className="pt-1 space-y-1.5">
-              <p className="text-xs font-medium text-[#b5add0]">Supporting Sources</p>
+              <p className="text-xs font-medium text-[#b5add0]">Sources &amp; Evidence</p>
               <div className="space-y-1.5">
                 {run.citations.map((cit) => (
                   <div
@@ -268,13 +396,25 @@ const MessageItem: React.FC<{
                     className="rounded-lg border border-white/8 bg-[#12101c] px-3 py-2 text-xs"
                   >
                     <div className="flex items-center justify-between gap-2 text-[#ded8f0]">
-                      <span className="font-medium">{cit.sourceTitle}</span>
-                      <Link
-                        to="/knowledge"
-                        className="text-[#a58ff8] hover:underline whitespace-nowrap shrink-0"
-                      >
-                        View in Knowledge
-                      </Link>
+                      <span className="font-medium truncate">{cit.sourceTitle}</span>
+                      {cit.url ? (
+                        <a
+                          href={cit.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 text-[#8ad8ff] hover:underline whitespace-nowrap shrink-0"
+                        >
+                          <span>Open source</span>
+                          <ExternalLink className="h-3 w-3" />
+                        </a>
+                      ) : (
+                        <Link
+                          to="/knowledge"
+                          className="text-[#a58ff8] hover:underline whitespace-nowrap shrink-0"
+                        >
+                          View in Knowledge
+                        </Link>
+                      )}
                     </div>
                     <p className="mt-1 line-clamp-2 text-[#968fa9]">{cit.excerpt}</p>
                   </div>
@@ -283,7 +423,7 @@ const MessageItem: React.FC<{
             </div>
           )}
 
-          {/* Action Bar: Copy + Download + Expandable Orchestrator Trace + Expandable Tool Outputs */}
+          {/* Action Bar: Copy + Regenerate + Download + Expandable Orchestrator Trace + Expandable Tool Outputs */}
           {!isUser && !message.error && !message.isStreaming && (
             <div className="flex flex-wrap items-center gap-2.5 pt-1">
               <button
@@ -297,6 +437,17 @@ const MessageItem: React.FC<{
                   <Copy className="h-3.5 w-3.5" />
                 )}
                 <span>{copied ? 'Copied' : 'Copy response'}</span>
+              </button>
+
+              <button
+                type="button"
+                disabled={isSending}
+                onClick={() => onRegenerate(message.id)}
+                aria-label="Regenerate response"
+                className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-white/8 bg-[#13111d] px-2.5 py-1 text-xs text-[#b5add0] hover:border-white/20 hover:text-white disabled:opacity-45 whitespace-nowrap"
+              >
+                <RefreshCw className="h-3.5 w-3.5" />
+                <span>Regenerate</span>
               </button>
 
               <button
@@ -425,6 +576,12 @@ export const ChatView: React.FC = () => {
     setUseSentinel,
     researchMode,
     setResearchMode,
+    tone,
+    setTone,
+    responseLength,
+    setResponseLength,
+    mockMode,
+    setMockMode,
     pendingAttachments,
     addAttachment,
     removeAttachment,
@@ -435,6 +592,8 @@ export const ChatView: React.FC = () => {
     sendMessage,
     stopWaiting,
     retryFailedMessage,
+    editUserMessage,
+    regenerateResponse,
     generateVisualBlueprint,
     projects,
     activeProjectId,
@@ -596,6 +755,16 @@ export const ChatView: React.FC = () => {
             </div>
           )}
 
+          {mockMode && (
+            <div className="mb-6 rounded-xl border border-amber-500/30 bg-amber-950/25 p-3.5 text-xs leading-relaxed text-amber-200">
+              <strong className="font-semibold text-amber-100">
+                Local Mock Mode Active (₹0 UI Test):
+              </strong>{' '}
+              Responses are simulated deterministically on the server without consuming live Gemini
+              API quota. Disable Mock Mode in the composer bar anytime for live model inference.
+            </div>
+          )}
+
           {!hasMessages ? (
             /* Welcome Screen */
             <div className="py-4 sm:py-8">
@@ -718,7 +887,10 @@ export const ChatView: React.FC = () => {
                   <MessageItem
                     key={msg.id}
                     message={msg}
+                    isSending={isSending}
                     onRetry={(failed) => void retryFailedMessage(failed)}
+                    onEditUserPrompt={(id, newText) => void editUserMessage(id, newText)}
+                    onRegenerate={(assistantId) => void regenerateResponse(assistantId)}
                   />
                 ))}
 
@@ -950,9 +1122,42 @@ export const ChatView: React.FC = () => {
                   <option value="auto">Auto Orchestrate</option>
                   <option value="aurenyx-research">Aurenyx Research</option>
                   <option value="vaelor-forge">Vaelor Forge</option>
+                  <option value="vaelor-analyst">Vaelor Analyst</option>
                   <option value="vaelor-knowledge">Vaelor Knowledge</option>
                   <option value="vaelor-sentinel">Vaelor Sentinel</option>
                   <option value="vaelor-core">Vaelor Core</option>
+                </select>
+
+                <label className="sr-only" htmlFor="response-tone-select">
+                  Response tone
+                </label>
+                <select
+                  id="response-tone-select"
+                  aria-label="Response tone"
+                  value={tone}
+                  onChange={(e) => setTone(e.target.value as ResponseTone)}
+                  className="min-h-[40px] rounded-lg border border-white/10 bg-[#0e0c16] px-2 py-1 text-xs text-[#dbd5ec] focus:outline-none focus:border-[#8b6ff7] shrink-0"
+                >
+                  <option value="balanced">Tone: Balanced</option>
+                  <option value="professional">Tone: Professional</option>
+                  <option value="friendly">Tone: Friendly</option>
+                  <option value="academic">Tone: Academic</option>
+                  <option value="direct">Tone: Direct</option>
+                </select>
+
+                <label className="sr-only" htmlFor="response-length-select">
+                  Response length
+                </label>
+                <select
+                  id="response-length-select"
+                  aria-label="Response length"
+                  value={responseLength}
+                  onChange={(e) => setResponseLength(e.target.value as ResponseLength)}
+                  className="min-h-[40px] rounded-lg border border-white/10 bg-[#0e0c16] px-2 py-1 text-xs text-[#dbd5ec] focus:outline-none focus:border-[#8b6ff7] shrink-0"
+                >
+                  <option value="concise">Length: Concise</option>
+                  <option value="standard">Length: Standard</option>
+                  <option value="detailed">Length: Detailed</option>
                 </select>
 
                 {projects.length > 0 && (
@@ -964,7 +1169,7 @@ export const ChatView: React.FC = () => {
                       id="project-context-select"
                       value={activeProjectId || ''}
                       onChange={(e) => setActiveProjectId(e.target.value || undefined)}
-                      className="hidden md:inline-block min-h-[40px] max-w-[155px] truncate rounded-lg border border-white/10 bg-[#0e0c16] px-2.5 py-1 text-xs text-[#b5add0] shrink-0"
+                      className="hidden lg:inline-block min-h-[40px] max-w-[140px] truncate rounded-lg border border-white/10 bg-[#0e0c16] px-2 py-1 text-xs text-[#b5add0] shrink-0"
                     >
                       <option value="">No project scope</option>
                       {projects.map((p) => (
@@ -1004,6 +1209,21 @@ export const ChatView: React.FC = () => {
                 >
                   <ShieldCheck className="h-3.5 w-3.5" />
                   <span className="hidden sm:inline">Sentinel</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setMockMode((v) => !v)}
+                  aria-pressed={mockMode}
+                  aria-label="Toggle Local Mock Mode"
+                  className={`inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs transition-colors whitespace-nowrap shrink-0 ${
+                    mockMode
+                      ? 'border-amber-400/45 bg-amber-950/35 text-amber-200'
+                      : 'border-white/10 bg-[#0e0c16] text-[#8f88a3]'
+                  }`}
+                >
+                  <FlaskConical className="h-3.5 w-3.5" />
+                  <span className="hidden sm:inline">Mock Mode</span>
                 </button>
 
                 <button

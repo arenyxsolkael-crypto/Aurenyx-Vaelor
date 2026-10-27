@@ -66,6 +66,41 @@ class PrivateChatStore(private val storageDirectory: File) {
     }
 
     @Synchronized
+    fun renameConversation(
+        conversationId: String,
+        newTitle: String,
+        nowEpochMs: Long = System.currentTimeMillis()
+    ): List<PrivateConversation> {
+        val sanitizedTitle = newTitle.trim().take(80).ifEmpty { "Untitled Chat" }
+        val updated = loadConversations().map { conv ->
+            if (conv.id == conversationId) {
+                conv.copy(title = sanitizedTitle, updatedAtEpochMs = nowEpochMs)
+            } else {
+                conv
+            }
+        }
+        persist(updated)
+        return updated
+    }
+
+    @Synchronized
+    fun setArchived(
+        conversationId: String,
+        archived: Boolean,
+        nowEpochMs: Long = System.currentTimeMillis()
+    ): List<PrivateConversation> {
+        val updated = loadConversations().map { conv ->
+            if (conv.id == conversationId) {
+                conv.copy(archived = archived, updatedAtEpochMs = nowEpochMs)
+            } else {
+                conv
+            }
+        }
+        persist(updated)
+        return updated
+    }
+
+    @Synchronized
     fun deleteConversation(conversationId: String): List<PrivateConversation> {
         val remaining = loadConversations().filterNot { it.id == conversationId }
         persist(remaining)

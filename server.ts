@@ -15,6 +15,8 @@ import { EphemeralSessionStore } from './src/server/store.ts';
 import { executeToolWithPermissions, TOOL_REGISTRY } from './src/server/tools.ts';
 import {
   ChatRequestSchema,
+  ConversationPatchSchema,
+  ConversationSyncSchema,
   detectSecretInText,
   DocumentIngestSchema,
   MemoryCreateSchema,
@@ -56,6 +58,12 @@ export function createApiApp(deps: AppServerDependencies = {}) {
     windowMs: 60_000,
     maxRequests: rateLimitMax,
   });
+
+  const getOwnerSessionId = (req: Request): string => {
+    const rawHeader = req.header('x-vaelor-session-token') || '';
+    const cleaned = rawHeader.trim().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80);
+    return cleaned || 'default-session';
+  };
 
   // Security headers & bounded JSON body size limit (2 MB for validated multimodal attachments)
   app.disable('x-powered-by');
@@ -127,12 +135,15 @@ export function createApiApp(deps: AppServerDependencies = {}) {
     const status = gateway.getStatus();
     const payload: HealthResponse = {
       ok: true,
+      version: OFFICIAL_ATTRIBUTION.version,
       configured: status.configured,
       provider: status.provider,
       primaryModel: status.configured ? status.primaryModel : undefined,
       fastModel: status.configured ? status.fastModel : undefined,
       paidModelsEnabled: status.paidModelsEnabled,
       liveSearchConfigured: Boolean(status.liveSearchConfigured),
+      groundedSearchMode: status.groundedSearchMode,
+      mockModeDefault: Boolean(status.mockModeDefault),
       maxStepsPerRequest: MAX_ORCHESTRATOR_MODEL_STEPS,
       rateLimitPerMinute: rateLimitMax,
       storageMode: 'in-memory-ephemeral',
@@ -166,6 +177,7 @@ export function createApiApp(deps: AppServerDependencies = {}) {
           primaryModel: status.primaryModel,
           fastModel: status.fastModel,
           paidModelsEnabled: status.paidModelsEnabled,
+          mockModeAvailable: true,
           supportsStreaming: Boolean(gateway.stream),
           supportsVision: true,
           supportsStructuredJson: true,
@@ -184,6 +196,10 @@ export function createApiApp(deps: AppServerDependencies = {}) {
         availability: tool.availability,
         requiresConfirmation: tool.requiresConfirmation,
         description: tool.description,
+        timeoutMs: tool.timeoutMs,
+        maxCallsPerTask: tool.maxCallsPerTask,
+        errorStrategy: tool.errorStrategy,
+        outputSchemaSummary: tool.outputSchemaSummary,
         setupGuide: tool.setupGuide,
       })),
     });
@@ -211,6 +227,9 @@ export function createApiApp(deps: AppServerDependencies = {}) {
       description: tool.description,
       allowedAgents: tool.allowedAgents,
       timeoutMs: tool.timeoutMs,
+      maxCallsPerTask: tool.maxCallsPerTask,
+      errorStrategy: tool.errorStrategy,
+      outputSchemaSummary: tool.outputSchemaSummary,
       resultFormat: tool.resultFormat,
       setupGuide: tool.setupGuide,
     }));
@@ -237,6 +256,10 @@ export function createApiApp(deps: AppServerDependencies = {}) {
       preferredAgent,
       useSentinel,
       researchMode,
+      tone,
+      responseLength,
+      mockMode,
+      bypassCache,
       requestedTools,
       attachments,
       projectId,
@@ -256,6 +279,14 @@ export function createApiApp(deps: AppServerDependencies = {}) {
       return;
     }
 
+    const ownerSessionId = getOwnerSessionId(req);
+    const abortController = new AbortController();
+    res.on('close', () => {
+      if (!res.writableEnded) {
+        abortController.abort();
+      }
+    });
+
     const project = projectId ? store.projects.find((p) => p.id === projectId) : undefined;
 
     try {
@@ -265,6 +296,12 @@ export function createApiApp(deps: AppServerDependencies = {}) {
         preferredAgent,
         useSentinel,
         researchMode,
+        tone,
+        responseLength,
+        mockMode,
+        bypassCache,
+        ownerSessionId,
+        signal: abortController.signal,
         requestedTools,
         attachments,
         project,
@@ -286,21 +323,25 @@ export function createApiApp(deps: AppServerDependencies = {}) {
       }
 
       if (err instanceof ModelGatewayError) {
-        res.status(err.statusCode).json({
-          error: err.message,
-          code: err.code,
-          retryable: err.retryable,
-          taskRun: attachedRun,
-        });
+        if (!res.writableEnded) {
+          res.status(err.statusCode).json({
+            error: err.message,
+            code: err.code,
+            retryable: err.retryable,
+            taskRun: attachedRun,
+          });
+        }
         return;
       }
 
-      res.status(502).json({
-        error: 'The orchestrator could not complete the request safely. Please try again.',
-        code: 'ORCHESTRATOR_FAILURE',
-        retryable: true,
-        taskRun: attachedRun,
-      });
+      if (!res.writableEnded) {
+        res.status(502).json({
+          error: 'The orchestrator could not complete the request safely. Please try again.',
+          code: 'ORCHESTRATOR_FAILURE',
+          retryable: true,
+          taskRun: attachedRun,
+        });
+      }
     }
   });
 
@@ -323,6 +364,10 @@ export function createApiApp(deps: AppServerDependencies = {}) {
       preferredAgent,
       useSentinel,
       researchMode,
+      tone,
+      responseLength,
+      mockMode,
+      bypassCache,
       requestedTools,
       attachments,
       projectId,
@@ -347,6 +392,14 @@ export function createApiApp(deps: AppServerDependencies = {}) {
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders?.();
 
+    const ownerSessionId = getOwnerSessionId(req);
+    const abortController = new AbortController();
+    res.on('close', () => {
+      if (!res.writableEnded) {
+        abortController.abort();
+      }
+    });
+
     const writeEvent = (event: AIStreamEvent) => {
       if (!res.writableEnded) {
         res.write(`data: ${JSON.stringify(event)}\n\n`);
@@ -362,6 +415,12 @@ export function createApiApp(deps: AppServerDependencies = {}) {
         preferredAgent,
         useSentinel,
         researchMode,
+        tone,
+        responseLength,
+        mockMode,
+        bypassCache,
+        ownerSessionId,
+        signal: abortController.signal,
         requestedTools,
         attachments,
         project,
@@ -378,7 +437,9 @@ export function createApiApp(deps: AppServerDependencies = {}) {
         taskRun: result.taskRun,
         generatedSvgBlueprint: result.generatedSvgBlueprint,
       });
-      res.end();
+      if (!res.writableEnded) {
+        res.end();
+      }
     } catch (err) {
       const attachedRun = (err as { taskRun?: StructuredTaskRun })?.taskRun;
       if (attachedRun) {
@@ -400,7 +461,9 @@ export function createApiApp(deps: AppServerDependencies = {}) {
           retryable,
         },
       });
-      res.end();
+      if (!res.writableEnded) {
+        res.end();
+      }
     }
   });
 
@@ -436,6 +499,7 @@ export function createApiApp(deps: AppServerDependencies = {}) {
         documents: store.documents,
         memories: store.memories,
         confirmedByUser,
+        gateway,
       },
     });
 
@@ -599,12 +663,137 @@ export function createApiApp(deps: AppServerDependencies = {}) {
     });
   });
 
+  // 7b. Session-Isolated Conversation History Endpoints (prevents cross-user access across session tokens)
+  app.get('/api/conversations', (req: Request, res: Response) => {
+    const ownerSessionId = getOwnerSessionId(req);
+    const conversations = store.listConversationsForOwner(ownerSessionId);
+    res.json({
+      storageMode: 'in-memory-ephemeral',
+      conversations,
+    });
+  });
+
+  app.post('/api/conversations', (req: Request, res: Response) => {
+    const parsed = ConversationSyncSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: parsed.error.issues[0]?.message || 'Invalid conversation payload.',
+        code: 'VALIDATION_ERROR',
+      });
+      return;
+    }
+    const { id, title, projectId, archived, messages, createdAt, updatedAt } = parsed.data;
+    if (
+      detectSecretInText(title) ||
+      messages.some((m) => detectSecretInText(m.content))
+    ) {
+      res.status(400).json({
+        error: 'Security guardrail: Conversation contains a restricted secret pattern.',
+        code: 'SECRET_DETECTED_IN_INPUT',
+      });
+      return;
+    }
+
+    const ownerSessionId = getOwnerSessionId(req);
+    const upserted = store.upsertConversationForOwner(ownerSessionId, {
+      id,
+      title,
+      projectId,
+      archived,
+      messages,
+      createdAt: createdAt || new Date().toISOString(),
+      updatedAt: updatedAt || new Date().toISOString(),
+    });
+    if (upserted === 'forbidden') {
+      res.status(403).json({
+        error: 'Forbidden: Conversation belongs to another private session.',
+        code: 'FORBIDDEN_SESSION_ACCESS',
+      });
+      return;
+    }
+    res.status(201).json({ conversation: upserted });
+  });
+
+  app.get('/api/conversations/:id', (req: Request, res: Response) => {
+    const ownerSessionId = getOwnerSessionId(req);
+    const found = store.getConversationForOwner(ownerSessionId, String(req.params.id));
+    if (found === 'not_found') {
+      res.status(404).json({ error: 'Conversation not found.', code: 'NOT_FOUND' });
+      return;
+    }
+    if (found === 'forbidden') {
+      res.status(403).json({
+        error: 'Forbidden: Conversation belongs to another private session.',
+        code: 'FORBIDDEN_SESSION_ACCESS',
+      });
+      return;
+    }
+    res.json({ conversation: found });
+  });
+
+  app.patch('/api/conversations/:id', (req: Request, res: Response) => {
+    const parsed = ConversationPatchSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: parsed.error.issues[0]?.message || 'Invalid conversation update.',
+        code: 'VALIDATION_ERROR',
+      });
+      return;
+    }
+    if (parsed.data.title && detectSecretInText(parsed.data.title)) {
+      res.status(400).json({
+        error: 'Security guardrail: Title contains a restricted secret pattern.',
+        code: 'SECRET_DETECTED_IN_INPUT',
+      });
+      return;
+    }
+
+    const ownerSessionId = getOwnerSessionId(req);
+    const updated = store.patchConversationForOwner(
+      ownerSessionId,
+      String(req.params.id),
+      parsed.data
+    );
+    if (updated === 'not_found') {
+      res.status(404).json({ error: 'Conversation not found.', code: 'NOT_FOUND' });
+      return;
+    }
+    if (updated === 'forbidden') {
+      res.status(403).json({
+        error: 'Forbidden: Conversation belongs to another private session.',
+        code: 'FORBIDDEN_SESSION_ACCESS',
+      });
+      return;
+    }
+    res.json({ conversation: updated });
+  });
+
+  app.delete('/api/conversations/:id', (req: Request, res: Response) => {
+    const ownerSessionId = getOwnerSessionId(req);
+    const result = store.deleteConversationForOwner(ownerSessionId, String(req.params.id));
+    if (result === 'not_found') {
+      res.status(404).json({ error: 'Conversation not found.', code: 'NOT_FOUND' });
+      return;
+    }
+    if (result === 'forbidden') {
+      res.status(403).json({
+        error: 'Forbidden: Conversation belongs to another private session.',
+        code: 'FORBIDDEN_SESSION_ACCESS',
+      });
+      return;
+    }
+    res.json({ ok: true });
+  });
+
   // 8. Privacy & Session Data Purge Controls
   app.post('/api/session/purge', (req: Request, res: Response) => {
     const scopeRaw = req.body?.scope;
     const validScopes = new Set(['conversations', 'memories', 'documents', 'tasks', 'all']);
     const scope = validScopes.has(scopeRaw) ? scopeRaw : 'all';
-    store.clearScope(scope);
+    const ownerSessionId = req.header('x-vaelor-session-token')
+      ? getOwnerSessionId(req)
+      : undefined;
+    store.clearScope(scope, ownerSessionId);
     res.json({
       ok: true,
       clearedScope: scope,
@@ -703,7 +892,7 @@ async function startServer() {
   }
 
   httpServer.listen(port, '0.0.0.0', () => {
-    console.log(`Aurenyx Vaelor 0.1 server listening on http://0.0.0.0:${port}`);
+    console.log(`Aurenyx Vaelor 0.2 server listening on http://0.0.0.0:${port}`);
   });
 }
 

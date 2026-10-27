@@ -1,5 +1,6 @@
 import React from 'react';
 import {
+  BarChart3,
   BookOpen,
   Code2,
   Compass,
@@ -18,6 +19,7 @@ const AGENT_ICONS: Record<AgentId, React.ComponentType<{ className?: string }>> 
   'vaelor-core': Cpu,
   'aurenyx-research': Compass,
   'vaelor-forge': Code2,
+  'vaelor-analyst': BarChart3,
   'vaelor-knowledge': BookOpen,
   'vaelor-sentinel': ShieldCheck,
 };
@@ -130,7 +132,10 @@ export const AgentActivityPanel: React.FC<AgentActivityPanelProps> = ({ onCloseM
               </p>
               {latestTask.sentinelReview && (
                 <p className="text-[11px] leading-relaxed text-[#a9a2bc]">
-                  Sentinel: {latestTask.sentinelReview.summary}
+                  {latestTask.sentinelReview.verificationLabel
+                    ? `${latestTask.sentinelReview.verificationLabel}: `
+                    : 'Sentinel: '}
+                  {latestTask.sentinelReview.summary}
                 </p>
               )}
               {latestTask.toolCalls.length > 0 && (

@@ -33,9 +33,9 @@ const TRUSTGRID_PRINCIPLES = [
 
 const CAPABILITY_AUDIT = [
   {
-    item: '01. General Conversation & Multi-Agent Orchestration',
+    item: '01. Universal Chat Engine v1.0 & Multi-Agent Orchestration (v0.2)',
     status: 'Implemented',
-    notes: 'Handled by Vaelor Core, Research, Forge, Knowledge, and Sentinel via server-isolated Gemini gateway.',
+    notes: '6 roles (Core, Research, Forge, Analyst, Knowledge, Sentinel), schema-validated planner, KaTeX math, Tone/Length controls, and Local Mock Mode.',
   },
   {
     item: '02. Aurenyx TrustGrid Governance & Passport Suite',
@@ -48,9 +48,9 @@ const CAPABILITY_AUDIT = [
     notes: 'Complete Android Studio / Gradle project in /android with private internal history deletion, TLS config, and Play Internal Testing guide.',
   },
   {
-    item: '04. Web Research Provider',
-    status: 'Requires Config',
-    notes: 'Adapter ready; requires server SEARCH_API_KEY. Never fabricates live search URLs or citations.',
+    item: '04. Grounded Web Search Connector',
+    status: 'Implemented',
+    notes: 'Server-side Gemini Google Search Grounding extracts real web URLs/titles; degrades honestly with zero fabricated citations when quota-limited or offline.',
   },
   {
     item: '05. Document Summarization & Grounding',

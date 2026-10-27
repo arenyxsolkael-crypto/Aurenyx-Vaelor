@@ -10,19 +10,35 @@ import type {
   ToolStage,
 } from '../shared/types.ts';
 import { AGENT_DEFINITIONS } from './agents.ts';
+import type { ModelGateway } from './modelGateway.ts';
 import { wrapUntrustedData } from './validation.ts';
 
 export interface ToolExecutionContext {
   documents: KnowledgeDocument[];
   memories: SavedMemory[];
   confirmedByUser?: boolean;
+  gateway?: ModelGateway;
+  mockMode?: boolean;
+  signal?: AbortSignal;
 }
 
-export interface ToolResultPayload {
-  formattedOutput: string;
-  citations?: CitationItem[];
-  svgArtifact?: string;
-}
+export const CitationItemSchema = z.object({
+  id: z.string().min(1),
+  sourceTitle: z.string().min(1),
+  sourceType: z.enum(['document', 'memory', 'tool', 'web']),
+  excerpt: z.string(),
+  url: z.string().url().optional(),
+  documentId: z.string().optional(),
+  chunkIndex: z.number().int().optional(),
+});
+
+export const ToolResultPayloadSchema = z.object({
+  formattedOutput: z.string().min(1),
+  citations: z.array(CitationItemSchema).optional(),
+  svgArtifact: z.string().optional(),
+});
+
+export type ToolResultPayload = z.infer<typeof ToolResultPayloadSchema>;
 
 export interface ToolDefinition<TSchema extends z.ZodTypeAny = z.ZodTypeAny> {
   name: ToolName;
@@ -31,8 +47,12 @@ export interface ToolDefinition<TSchema extends z.ZodTypeAny = z.ZodTypeAny> {
   requiresConfirmation: boolean;
   description: string;
   inputSchema: TSchema;
+  outputSchema: z.ZodTypeAny;
+  outputSchemaSummary: string;
   allowedAgents: AgentId[];
   timeoutMs: number;
+  maxCallsPerTask: number;
+  errorStrategy: 'return_structured_error' | 'graceful_fallback_notice';
   resultFormat: string;
   setupGuide?: string;
   execute: (args: z.infer<TSchema>, context: ToolExecutionContext) => Promise<ToolResultPayload>;
@@ -284,7 +304,9 @@ export function inspectAndFormatJson(rawJson: string): {
   if (Array.isArray(parsed)) {
     const first = parsed[0];
     const sampleKeys =
-      first && typeof first === 'object' && !Array.isArray(first) ? Object.keys(first).slice(0, 20) : [];
+      first && typeof first === 'object' && !Array.isArray(first)
+        ? Object.keys(first).slice(0, 20)
+        : [];
     return {
       valid: true,
       rootType: 'array',
@@ -306,6 +328,107 @@ export function inspectAndFormatJson(rawJson: string): {
     rootType: 'primitive',
     topLevelKeys: [],
     formattedPreview: pretty.slice(0, 1000),
+  };
+}
+
+/**
+ * Deterministic Structured Formatter (v0.2 Tool Registry).
+ * Converts JSON arrays/objects, CSV rows, or key:value pairs into canonical JSON or Markdown tables.
+ */
+export function formatStructuredContent(
+  rawInput: string,
+  targetFormat: 'markdown_table' | 'json'
+): { targetFormat: 'markdown_table' | 'json'; rowCount: number; formatted: string } {
+  const trimmed = rawInput.trim();
+  if (!trimmed) {
+    throw new Error('Structured formatter input cannot be empty.');
+  }
+
+  let records: Record<string, string | number | boolean | null>[] = [];
+
+  // 1. Try JSON first
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (Array.isArray(parsed)) {
+        records = parsed.slice(0, 50).map((item, idx) =>
+          item && typeof item === 'object' && !Array.isArray(item)
+            ? Object.fromEntries(
+                Object.entries(item as Record<string, unknown>).map(([k, v]) => [
+                  k,
+                  typeof v === 'object' ? JSON.stringify(v) : (v as string | number | boolean | null),
+                ])
+              )
+            : { index: idx + 1, value: String(item) }
+        );
+      } else if (parsed && typeof parsed === 'object') {
+        records = Object.entries(parsed as Record<string, unknown>).map(([k, v]) => ({
+          Field: k,
+          Value: typeof v === 'object' ? JSON.stringify(v) : String(v ?? ''),
+        }));
+      }
+    } catch {
+      // Fall through to CSV or key:value parsing
+    }
+  }
+
+  // 2. Try CSV lines
+  if (records.length === 0) {
+    const lines = trimmed
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    if (lines.length >= 2 && lines[0].includes(',')) {
+      const headers = parseCsvLine(lines[0]);
+      records = lines.slice(1, 51).map((ln) => {
+        const vals = parseCsvLine(ln);
+        return Object.fromEntries(headers.map((h, i) => [h || `Col_${i + 1}`, vals[i] ?? '']));
+      });
+    } else {
+      // 3. Key: value lines or bullet list items
+      records = lines.slice(0, 50).map(
+        (ln, idx): Record<string, string | number | boolean | null> => {
+          const clean = ln.replace(/^[-*•]\s+/, '');
+          const sepIdx = clean.indexOf(':');
+          if (sepIdx > 0 && sepIdx < 48) {
+            return {
+              Key: clean.slice(0, sepIdx).trim(),
+              Value: clean.slice(sepIdx + 1).trim(),
+            };
+          }
+          return { Item: idx + 1, Content: clean };
+        }
+      );
+    }
+  }
+
+  if (targetFormat === 'json') {
+    return {
+      targetFormat: 'json',
+      rowCount: records.length,
+      formatted: JSON.stringify(records, null, 2),
+    };
+  }
+
+  const columns = Array.from(
+    records.reduce((set, row) => {
+      Object.keys(row).forEach((k) => set.add(k));
+      return set;
+    }, new Set<string>())
+  );
+  const headerLine = `| ${columns.join(' | ')} |`;
+  const dividerLine = `| ${columns.map(() => '---').join(' | ')} |`;
+  const bodyLines = records.map(
+    (row) =>
+      `| ${columns
+        .map((c) => String(row[c] ?? '').replace(/\|/g, '\\|').replace(/\r?\n/g, ' '))
+        .join(' | ')} |`
+  );
+
+  return {
+    targetFormat: 'markdown_table',
+    rowCount: records.length,
+    formatted: [headerLine, dividerLine, ...bodyLines].join('\n'),
   };
 }
 
@@ -420,6 +543,11 @@ const JsonValidatorSchema = z.object({
   jsonText: z.string().trim().min(1).max(30000),
 });
 
+const StructuredFormatterSchema = z.object({
+  rawInput: z.string().trim().min(1).max(30000),
+  targetFormat: z.enum(['markdown_table', 'json']).default('markdown_table'),
+});
+
 const TaskPlannerSchema = z.object({
   objective: z.string().trim().min(3).max(2000),
   domain: z.enum(['software', 'research', 'strategy', 'general']).default('general'),
@@ -470,8 +598,12 @@ export const TOOL_REGISTRY: Record<ToolName, ToolDefinition<any>> = {
     requiresConfirmation: false,
     description: 'Evaluates deterministic arithmetic expressions safely without eval().',
     inputSchema: CalculatorSchema,
-    allowedAgents: ['vaelor-core', 'aurenyx-research', 'vaelor-forge'],
+    outputSchema: ToolResultPayloadSchema,
+    outputSchemaSummary: '{ expression: string, value: number }',
+    allowedAgents: ['vaelor-core', 'aurenyx-research', 'vaelor-forge', 'vaelor-analyst'],
     timeoutMs: 1500,
+    maxCallsPerTask: 2,
+    errorStrategy: 'return_structured_error',
     resultFormat: 'JSON numeric result with normalized expression',
     execute: async ({ expression }) => {
       const value = evaluateSafeMath(expression);
@@ -488,8 +620,12 @@ export const TOOL_REGISTRY: Record<ToolName, ToolDefinition<any>> = {
     requiresConfirmation: false,
     description: 'Computes ISO-8601 UTC timestamps, timezone formatting, and exact date intervals.',
     inputSchema: DateTimeUtilitySchema,
-    allowedAgents: ['vaelor-core', 'aurenyx-research', 'vaelor-forge'],
+    outputSchema: ToolResultPayloadSchema,
+    outputSchemaSummary: '{ isoUtc: string, unixSeconds: number, formatted: string }',
+    allowedAgents: ['vaelor-core', 'aurenyx-research', 'vaelor-forge', 'vaelor-analyst'],
     timeoutMs: 1500,
+    maxCallsPerTask: 2,
+    errorStrategy: 'return_structured_error',
     resultFormat: 'ISO-8601 timestamp and optional interval calculation',
     execute: async ({ operation, startDate, endDate, timeZone }) => {
       const now = new Date();
@@ -548,8 +684,12 @@ export const TOOL_REGISTRY: Record<ToolName, ToolDefinition<any>> = {
     requiresConfirmation: false,
     description: 'Extracts structural statistics and salient sentences from untrusted user text.',
     inputSchema: TextSummarizerSchema,
-    allowedAgents: ['aurenyx-research', 'vaelor-knowledge'],
+    outputSchema: ToolResultPayloadSchema,
+    outputSchemaSummary: '{ wordCount: number, sentenceCount: number, salientExcerpts: string[] }',
+    allowedAgents: ['vaelor-core', 'aurenyx-research', 'vaelor-analyst', 'vaelor-knowledge'],
     timeoutMs: 2500,
+    maxCallsPerTask: 2,
+    errorStrategy: 'return_structured_error',
     resultFormat: 'Structural text profile with top salient sentences',
     execute: async ({ text, maxKeyPoints }: { text: string; maxKeyPoints: number }) => {
       const words = text.split(/\s+/).filter(Boolean);
@@ -564,7 +704,10 @@ export const TOOL_REGISTRY: Record<ToolName, ToolDefinition<any>> = {
         salientExcerpts: selected,
       };
       return {
-        formattedOutput: wrapUntrustedData('text_summarizer', JSON.stringify(summaryPayload, null, 2)),
+        formattedOutput: wrapUntrustedData(
+          'text_summarizer',
+          JSON.stringify(summaryPayload, null, 2)
+        ),
       };
     },
   },
@@ -574,10 +717,15 @@ export const TOOL_REGISTRY: Record<ToolName, ToolDefinition<any>> = {
     stage: 'A',
     availability: 'available',
     requiresConfirmation: false,
-    description: 'Transforms text casing/slugs/lists and calculates word, line, and reading-time metrics.',
+    description:
+      'Transforms text casing/slugs/lists and calculates word, line, and reading-time metrics.',
     inputSchema: TextTransformerSchema,
+    outputSchema: ToolResultPayloadSchema,
+    outputSchemaSummary: '{ mode: string, wordCount: number, preview: string }',
     allowedAgents: ['vaelor-core', 'aurenyx-research', 'vaelor-knowledge'],
     timeoutMs: 2000,
+    maxCallsPerTask: 2,
+    errorStrategy: 'return_structured_error',
     resultFormat: 'Text metrics and transformed output',
     execute: async ({ text, mode }) => {
       const words = text.split(/\s+/).filter(Boolean);
@@ -620,10 +768,15 @@ export const TOOL_REGISTRY: Record<ToolName, ToolDefinition<any>> = {
     stage: 'A',
     availability: 'available',
     requiresConfirmation: false,
-    description: 'Validates JSON syntax, inspects top-level structure, and formats canonical JSON safely.',
+    description:
+      'Validates JSON syntax, inspects top-level structure, and formats canonical JSON safely.',
     inputSchema: JsonValidatorSchema,
-    allowedAgents: ['vaelor-core', 'vaelor-forge', 'vaelor-knowledge'],
+    outputSchema: ToolResultPayloadSchema,
+    outputSchemaSummary: '{ valid: boolean, rootType: string, topLevelKeys: string[] }',
+    allowedAgents: ['vaelor-core', 'vaelor-forge', 'vaelor-analyst', 'vaelor-knowledge'],
     timeoutMs: 2000,
+    maxCallsPerTask: 2,
+    errorStrategy: 'return_structured_error',
     resultFormat: 'JSON validity report, root schema keys, and pretty-printed preview',
     execute: async ({ jsonText }) => {
       const report = inspectAndFormatJson(jsonText);
@@ -633,15 +786,49 @@ export const TOOL_REGISTRY: Record<ToolName, ToolDefinition<any>> = {
     },
   },
 
+  structured_formatter: {
+    name: 'structured_formatter',
+    stage: 'A',
+    availability: 'available',
+    requiresConfirmation: false,
+    description:
+      'Normalizes JSON objects, CSV rows, or key-value lists into clean Markdown tables or canonical JSON.',
+    inputSchema: StructuredFormatterSchema,
+    outputSchema: ToolResultPayloadSchema,
+    outputSchemaSummary: '{ targetFormat: "markdown_table" | "json", rowCount: number, formatted: string }',
+    allowedAgents: [
+      'vaelor-core',
+      'aurenyx-research',
+      'vaelor-forge',
+      'vaelor-analyst',
+      'vaelor-knowledge',
+    ],
+    timeoutMs: 2000,
+    maxCallsPerTask: 2,
+    errorStrategy: 'return_structured_error',
+    resultFormat: 'Markdown table or canonical JSON array',
+    execute: async ({ rawInput, targetFormat }) => {
+      const res = formatStructuredContent(rawInput, targetFormat);
+      return {
+        formattedOutput: wrapUntrustedData('structured_formatter', JSON.stringify(res, null, 2)),
+      };
+    },
+  },
+
   task_planner: {
     name: 'task_planner',
     stage: 'A',
     availability: 'available',
     requiresConfirmation: false,
-    description: 'Generates a bounded milestone checklist and verification criteria for complex objectives.',
+    description:
+      'Generates a bounded milestone checklist and verification criteria for complex objectives.',
     inputSchema: TaskPlannerSchema,
-    allowedAgents: ['vaelor-core', 'aurenyx-research', 'vaelor-forge'],
+    outputSchema: ToolResultPayloadSchema,
+    outputSchemaSummary: '{ objective: string, domain: string, boundedStages: string[] }',
+    allowedAgents: ['vaelor-core', 'aurenyx-research', 'vaelor-forge', 'vaelor-analyst'],
     timeoutMs: 2000,
+    maxCallsPerTask: 1,
+    errorStrategy: 'return_structured_error',
     resultFormat: 'Structured 4-stage execution blueprint',
     execute: async ({ objective, domain }) => {
       const stages =
@@ -680,8 +867,12 @@ export const TOOL_REGISTRY: Record<ToolName, ToolDefinition<any>> = {
     description:
       'Searches indexed session documents and explicitly saved user memories for passages matching the query.',
     inputSchema: DocumentProcessorSchema,
+    outputSchema: ToolResultPayloadSchema,
+    outputSchemaSummary: '{ retrievedPassages: Passage[], savedMemories: Memory[], citations: Citation[] }',
     allowedAgents: ['vaelor-knowledge'],
     timeoutMs: 3000,
+    maxCallsPerTask: 2,
+    errorStrategy: 'return_structured_error',
     resultFormat: 'Ranked untrusted document excerpts with genuine citation metadata',
     execute: async ({ query, maxPassages }: { query: string; maxPassages: number }, context) => {
       const terms = query
@@ -770,7 +961,10 @@ export const TOOL_REGISTRY: Record<ToolName, ToolDefinition<any>> = {
       };
 
       return {
-        formattedOutput: wrapUntrustedData('document_processor', JSON.stringify(payload, null, 2)),
+        formattedOutput: wrapUntrustedData(
+          'document_processor',
+          JSON.stringify(payload, null, 2)
+        ),
         citations,
       };
     },
@@ -784,8 +978,18 @@ export const TOOL_REGISTRY: Record<ToolName, ToolDefinition<any>> = {
     description:
       'Computes deterministic CSV dataset row/column counts, missing-value audits, and numeric column statistics (min, max, mean, sum).',
     inputSchema: CsvAnalyzerSchema,
-    allowedAgents: ['vaelor-core', 'aurenyx-research', 'vaelor-forge', 'vaelor-knowledge'],
+    outputSchema: ToolResultPayloadSchema,
+    outputSchemaSummary: '{ rowCount: number, columnCount: number, columns: CsvColumnSummary[] }',
+    allowedAgents: [
+      'vaelor-core',
+      'aurenyx-research',
+      'vaelor-forge',
+      'vaelor-analyst',
+      'vaelor-knowledge',
+    ],
     timeoutMs: 2500,
+    maxCallsPerTask: 2,
+    errorStrategy: 'return_structured_error',
     resultFormat: 'Structured CSV statistical profile',
     execute: async ({ csvText }) => {
       const analysis = analyzeCsvDataset(csvText);
@@ -803,23 +1007,33 @@ export const TOOL_REGISTRY: Record<ToolName, ToolDefinition<any>> = {
     description:
       'Constructs an evidence-grading matrix separating Verified Facts, Working Assumptions, and Open Unknowns.',
     inputSchema: ResearchFrameworkSchema,
+    outputSchema: ToolResultPayloadSchema,
+    outputSchemaSummary: '{ topic: string, groundedSearchMode: string, evidenceRubric: string[] }',
     allowedAgents: ['aurenyx-research'],
     timeoutMs: 2000,
+    maxCallsPerTask: 1,
+    errorStrategy: 'graceful_fallback_notice',
     resultFormat: 'Structured inquiry matrix + live search connectivity status',
-    execute: async ({ topic }) => {
-      const searchConfigured = Boolean(process.env.SEARCH_API_KEY?.trim());
+    execute: async ({ topic }, context) => {
+      const gatewayStatus = context.gateway?.getStatus();
+      const groundedMode = gatewayStatus?.groundedSearchMode ?? 'unavailable';
+      const searchConfigured = Boolean(
+        process.env.SEARCH_API_KEY?.trim() || gatewayStatus?.liveSearchConfigured
+      );
       return {
         formattedOutput: JSON.stringify(
           {
             topic: topic.slice(0, 240),
-            liveSearchConnected: searchConfigured,
-            connectivityNotice: searchConfigured
-              ? 'Authorized server search key detected.'
-              : 'Version 0.1 has no live web search API key configured on the server. Distinguish established domain knowledge from time-sensitive metrics requiring external primary-source lookup.',
+            liveSearchConnected: searchConfigured && !context.mockMode,
+            groundedSearchMode: context.mockMode ? 'mock-mode-disabled' : groundedMode,
+            connectivityNotice:
+              searchConfigured && !context.mockMode
+                ? 'Server-side search grounding adapter is configured; cite URLs strictly when web_search_connector returns verified groundingChunks.'
+                : 'No live web search results are active for this run. Distinguish established domain knowledge from time-sensitive metrics requiring external primary-source lookup.',
             evidenceRubric: [
-              'Established Facts: Well-documented mechanisms, standards, or supplied source data',
-              'Working Assumptions: Plausible inferences dependent on context or scale',
-              'Open Unknowns: Current pricing, live benchmarks, or unverified claims requiring primary sources',
+              '1. Direct Answer & Key Findings: Concise synthesis of verified facts',
+              '2. Evidence & Citations: Verbatim passages or grounded web URLs retrieved in this run',
+              '3. Uncertainties & Limitations: Current pricing, live benchmarks, or unverified claims requiring primary sources',
             ],
           },
           null,
@@ -837,8 +1051,12 @@ export const TOOL_REGISTRY: Record<ToolName, ToolDefinition<any>> = {
     description:
       'Generates deterministic, zero-cost SVG bar and line charts from structured label/value numeric series.',
     inputSchema: ChartGeneratorSchema,
-    allowedAgents: ['vaelor-core', 'aurenyx-research', 'vaelor-forge'],
+    outputSchema: ToolResultPayloadSchema,
+    outputSchemaSummary: '{ title: string, chartType: "bar" | "line", pointCount: number, svgArtifact: string }',
+    allowedAgents: ['vaelor-core', 'aurenyx-research', 'vaelor-forge', 'vaelor-analyst'],
     timeoutMs: 2000,
+    maxCallsPerTask: 1,
+    errorStrategy: 'return_structured_error',
     resultFormat: 'SVG vector chart artifact + numeric series summary',
     execute: async ({ title, chartType, series, unit }) => {
       const svg = buildDeterministicSvgChart({ title, chartType, series, unit });
@@ -862,17 +1080,86 @@ export const TOOL_REGISTRY: Record<ToolName, ToolDefinition<any>> = {
   web_search_connector: {
     name: 'web_search_connector',
     stage: 'B',
-    availability: 'requires_config',
+    availability:
+      process.env.GEMINI_API_KEY?.trim() || process.env.SEARCH_API_KEY?.trim()
+        ? 'available'
+        : 'requires_config',
     requiresConfirmation: false,
     description:
-      'Authorized external search provider adapter. Reports transparent configuration state when SEARCH_API_KEY is absent.',
+      'Server-side grounded web search via Gemini Google Search Grounding (or SEARCH_API_KEY). Never fabricates URLs when unavailable.',
     inputSchema: WebSearchConnectorSchema,
+    outputSchema: ToolResultPayloadSchema,
+    outputSchemaSummary: '{ status: "ok" | "no_sources" | "unavailable", sources: { title, url }[] }',
     allowedAgents: ['aurenyx-research'],
-    timeoutMs: 4000,
-    resultFormat: 'Search provider status or verified search results',
+    timeoutMs: 12_500,
+    maxCallsPerTask: 1,
+    errorStrategy: 'graceful_fallback_notice',
+    resultFormat: 'Verified grounded web citations or transparent unavailability notice',
     setupGuide:
-      'Set SEARCH_API_KEY (e.g., Brave Search Free Tier or Tavily Free Tier) in server environment variables to activate live web retrieval.',
-    execute: async ({ query }) => {
+      'Uses server-side GEMINI_API_KEY Google Search Grounding automatically when quota permits, or optional SEARCH_API_KEY.',
+    execute: async ({ query }, context) => {
+      if (context.mockMode) {
+        return {
+          formattedOutput: JSON.stringify(
+            {
+              query,
+              liveSearchConnected: false,
+              status: 'mock_mode',
+              message:
+                'Local Mock Mode is active: external live web search was intentionally skipped. Do not invent URLs or live citations.',
+            },
+            null,
+            2
+          ),
+          citations: [],
+        };
+      }
+
+      if (context.gateway?.searchGroundedWeb) {
+        const grounded = await context.gateway.searchGroundedWeb(query, {
+          timeoutMs: 11_000,
+          signal: context.signal,
+        });
+
+        if (grounded.status === 'ok' && grounded.citations.length > 0) {
+          return {
+            formattedOutput: wrapUntrustedData(
+              'web_search_results',
+              JSON.stringify(
+                {
+                  query,
+                  liveSearchConnected: true,
+                  status: 'ok',
+                  sourceCount: grounded.citations.length,
+                  summary: grounded.summaryText,
+                  sources: grounded.citations.map((c) => ({
+                    title: c.sourceTitle,
+                    url: c.url,
+                  })),
+                },
+                null,
+                2
+              )
+            ),
+            citations: grounded.citations,
+          };
+        }
+
+        return {
+          formattedOutput: JSON.stringify(
+            {
+              query,
+              liveSearchConnected: false,
+              status: grounded.status,
+              message: grounded.note,
+            },
+            null,
+            2
+          ),
+          citations: [],
+        };
+      }
+
       const searchKey = process.env.SEARCH_API_KEY?.trim();
       if (!searchKey) {
         return {
@@ -882,24 +1169,23 @@ export const TOOL_REGISTRY: Record<ToolName, ToolDefinition<any>> = {
               liveSearchConnected: false,
               status: 'requires_config',
               message:
-                'Live web search is not configured on this server (SEARCH_API_KEY not set). Do not invent URLs or live search results.',
-              setupSteps: [
-                'Obtain a free-tier API key from an authorized search provider (e.g., Brave Search or Tavily).',
-                'Add SEARCH_API_KEY in server-side Secrets or .env (never with a VITE_ prefix).',
-                'Restart the server to enable live query retrieval in Research Mode.',
-              ],
+                'Live web search is not configured on this server. Do not invent URLs or live search results.',
             },
             null,
             2
           ),
+          citations: [],
         };
       }
+
       return {
         formattedOutput: JSON.stringify({
           query,
-          liveSearchConnected: true,
-          note: 'SEARCH_API_KEY present; wire provider HTTP endpoint in production adapter.',
+          liveSearchConnected: false,
+          status: 'requires_config',
+          note: 'SEARCH_API_KEY detected; external search adapter not bound in this runtime.',
         }),
+        citations: [],
       };
     },
   },
@@ -912,8 +1198,12 @@ export const TOOL_REGISTRY: Record<ToolName, ToolDefinition<any>> = {
     description:
       'User-authorized Stage D workflow gate for external connectors (Supabase Cloud Sync, Workspace OAuth, Scheduled Jobs).',
     inputSchema: WorkflowConnectorGateSchema,
+    outputSchema: ToolResultPayloadSchema,
+    outputSchemaSummary: '{ connector: string, confirmedByUser: boolean, connectorStatus: string }',
     allowedAgents: ['vaelor-core'],
     timeoutMs: 2000,
+    maxCallsPerTask: 1,
+    errorStrategy: 'return_structured_error',
     resultFormat: 'Authorization audit & connector readiness status',
     setupGuide:
       'Requires explicit per-action user confirmation plus connector credentials (SUPABASE_URL / OAuth client) on the server.',
@@ -1036,13 +1326,30 @@ export async function executeToolWithPermissions(params: {
     };
   }
 
-  // 5. Execute within strict timeout boundary
+  // 5. Execute within strict timeout boundary & validate output schema
   try {
-    const result = await withTimeout(
+    const rawResult = await withTimeout(
       toolDef.execute(parsed.data, params.context),
       toolDef.timeoutMs,
       `Tool '${typedName}' timed out after ${toolDef.timeoutMs}ms.`
     );
+
+    const validatedOut = toolDef.outputSchema.safeParse(rawResult);
+    if (!validatedOut.success) {
+      return {
+        record: {
+          tool: typedName,
+          input: parsed.data as Record<string, unknown>,
+          output: '',
+          status: 'failed',
+          durationMs: Date.now() - started,
+          error: `Tool '${typedName}' output failed schema validation.`,
+        },
+        citations: [],
+      };
+    }
+
+    const result = validatedOut.data as ToolResultPayload;
     return {
       record: {
         tool: typedName,
@@ -1070,7 +1377,11 @@ export async function executeToolWithPermissions(params: {
   }
 }
 
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  timeoutMessage: string
+): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeoutPromise = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);

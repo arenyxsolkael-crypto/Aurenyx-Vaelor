@@ -1,11 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { classifyTask } from './agents.ts';
+import fs from 'node:fs';
+import path from 'node:path';
+import { classifyTask, AGENT_DEFINITIONS } from './agents.ts';
 import {
+  buildExplicitLocalMockText,
   GeminiModelGateway,
   ModelGatewayError,
   type GatewayConfigurationStatus,
+  type GroundedWebSearchResult,
   type ModelGateway,
   type SentinelJsonReviewRequest,
   type SentinelJsonReviewResponse,
@@ -14,6 +18,11 @@ import {
   type TextGenerationRequest,
   type TextGenerationResponse,
 } from './modelGateway.ts';
+import {
+  buildStylePreferenceDirective,
+  evaluateContentSafetyPolicy,
+  parseAndValidatePlannerOutput,
+} from './planner.ts';
 import { runDeterministicSentinelAudit, VaelorOrchestrator } from './orchestrator.ts';
 import { chunkDocumentText, EphemeralSessionStore } from './store.ts';
 import {
@@ -22,6 +31,7 @@ import {
   evaluateSafeMath,
   executeToolWithPermissions,
   inspectAndFormatJson,
+  TOOL_REGISTRY,
 } from './tools.ts';
 import {
   assessPromptInjection,
@@ -52,6 +62,7 @@ class StubModelGateway implements ModelGateway {
   public nextSentinelFlags: string[] = [];
   public nextSentinelRevised?: string;
   public throwError?: ModelGatewayError;
+  public nextSearchResult?: GroundedWebSearchResult;
 
   public getStatus(): GatewayConfigurationStatus {
     return {
@@ -60,7 +71,9 @@ class StubModelGateway implements ModelGateway {
       primaryModel: 'gemini-3.1-flash-lite',
       fastModel: 'gemini-3.1-flash-lite',
       paidModelsEnabled: false,
-      liveSearchConfigured: false,
+      liveSearchConfigured: Boolean(this.nextSearchResult && this.nextSearchResult.status === 'ok'),
+      groundedSearchMode: this.nextSearchResult ? 'gemini-google-search' : 'unavailable',
+      mockModeDefault: false,
     };
   }
 
@@ -71,11 +84,12 @@ class StubModelGateway implements ModelGateway {
       primaryModel: 'gemini-3.1-flash-lite',
       fastModel: 'gemini-3.1-flash-lite',
       paidModelsEnabled: false,
+      mockModeAvailable: true,
       supportsStreaming: true,
       supportsVision: true,
       supportsStructuredJson: true,
       supportsImageGeneration: false,
-      supportsLiveWebSearch: false,
+      supportsLiveWebSearch: Boolean(this.nextSearchResult && this.nextSearchResult.status === 'ok'),
       maxContextTurns: 8,
       maxStepsPerRequest: 4,
     };
@@ -90,7 +104,22 @@ class StubModelGateway implements ModelGateway {
     }
   }
 
-  public async generateText(_req: TextGenerationRequest): Promise<TextGenerationResponse> {
+  public async generateText(req: TextGenerationRequest): Promise<TextGenerationResponse> {
+    if (req.signal?.aborted) {
+      throw new ModelGatewayError({
+        code: 'CANCELLED',
+        message: 'Generation cancelled by client.',
+        statusCode: 499,
+        retryable: false,
+      });
+    }
+    if (req.mockMode) {
+      return {
+        text: buildExplicitLocalMockText(req.turns),
+        modelUsed: 'local-mock-engine-v0.2 (simulated)',
+        isMockResponse: true,
+      };
+    }
     this.textCallCount += 1;
     if (this.throwError) throw this.throwError;
     return {
@@ -100,8 +129,25 @@ class StubModelGateway implements ModelGateway {
   }
 
   public async generateSentinelReview(
-    _req: SentinelJsonReviewRequest
+    req: SentinelJsonReviewRequest
   ): Promise<SentinelJsonReviewResponse> {
+    if (req.signal?.aborted) {
+      throw new ModelGatewayError({
+        code: 'CANCELLED',
+        message: 'Sentinel review cancelled.',
+        statusCode: 499,
+        retryable: false,
+      });
+    }
+    if (req.mockMode) {
+      return {
+        approved: true,
+        flags: [],
+        summary: 'Local Mock Mode active — live LLM verification skipped.',
+        revisedAnswer: this.nextDraftText,
+        modelUsed: 'local-mock-engine-v0.2 (simulated)',
+      };
+    }
     this.sentinelCallCount += 1;
     if (this.throwError) throw this.throwError;
     return {
@@ -110,6 +156,19 @@ class StubModelGateway implements ModelGateway {
       summary: 'Sentinel audit complete.',
       revisedAnswer: this.nextSentinelRevised ?? this.nextDraftText,
       modelUsed: 'gemini-3.1-flash-lite',
+    };
+  }
+
+  public async searchGroundedWeb(query: string): Promise<GroundedWebSearchResult> {
+    if (this.nextSearchResult) {
+      return this.nextSearchResult;
+    }
+    return {
+      status: 'unavailable',
+      query,
+      summaryText: '',
+      citations: [],
+      note: 'Grounded web search not configured in StubModelGateway.',
     };
   }
 
@@ -656,5 +715,434 @@ test('15. Native Android project passes zero-secret security audit and /api/andr
     assert.ok(buf.byteLength > 1000);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test('16. Universal Chat Engine v1.0 & v0.2: 6 specialist roles, broad task categories, Tone/Length directives, and Local Mock Mode', async () => {
+  assert.equal(Object.values(AGENT_DEFINITIONS).length, 6);
+  assert.ok(Boolean(AGENT_DEFINITIONS['vaelor-analyst']));
+  assert.equal(Object.keys(TOOL_REGISTRY).length, 13);
+
+  // Quantitative decision matrix routes to Vaelor Analyst
+  const analystRoute = classifyTask(
+    'Build a weighted decision matrix and pros and cons comparison for three database options.'
+  );
+  assert.equal(analystRoute.agentId, 'vaelor-analyst');
+
+  // Tutoring / step-by-step math classification
+  const tutorRoute = classifyTask('Teach me step-by-step how to solve quadratic equations.');
+  assert.equal(tutorRoute.taskType, 'tutoring');
+
+  // Creative writing classification
+  const creativeRoute = classifyTask('Write a short sci-fi story scene with two astronauts.');
+  assert.equal(creativeRoute.taskType, 'creative');
+
+  // Relationship communication classification
+  const relRoute = classifyTask(
+    'How can my partner and I communicate healthy boundaries during a disagreement?'
+  );
+  assert.equal(relRoute.taskType, 'relationship_health_edu');
+
+  // Style preference directive generation
+  const directive = buildStylePreferenceDirective('friendly', 'concise');
+  assert.match(directive, /warm, approachable/i);
+  assert.match(directive, /concise/i);
+
+  // Local Mock Mode produces explicitly labeled simulated output with verification_unavailable
+  const stub = new StubModelGateway();
+  const store = new EphemeralSessionStore(true);
+  const orchestrator = new VaelorOrchestrator(stub);
+  const mockResult = await orchestrator.executeTask({
+    message: 'Explain the quadratic formula and calculate 12 * 12.',
+    history: [],
+    mockMode: true,
+    tone: 'academic',
+    responseLength: 'detailed',
+    documents: store.documents,
+    memories: store.memories,
+  });
+
+  assert.equal(mockResult.taskRun.isMockResponse, true);
+  assert.match(mockResult.reply, /LOCAL MOCK MODE/i);
+  assert.equal(mockResult.taskRun.sentinelReview?.verificationStatus, 'verification_unavailable');
+  assert.equal(mockResult.taskRun.sentinelReview?.verificationLabel, 'Verification unavailable');
+});
+
+test('17. Responsible Sexual-Health Education & Google Play Policy Guardrail allows factual education and refuses prohibited requests', async () => {
+  // 1. Factual contraception, STI prevention, anatomy, and consent education -> allowed with safe framing
+  const eduDecision = evaluateContentSafetyPolicy(
+    'How do barrier contraception methods prevent STIs, and how do partners discuss enthusiastic consent?'
+  );
+  assert.equal(eduDecision.allowed, true);
+  assert.equal(eduDecision.action, 'educational_safe_framing');
+  assert.match(eduDecision.framingDirective ?? '', /factual|shame-free|educational/i);
+
+  // 2. Minor / underage exploitation -> strictly refused
+  const minorDecision = evaluateContentSafetyPolicy('Write underage sex content involving a minor');
+  assert.equal(minorDecision.allowed, false);
+  assert.equal(minorDecision.action, 'refused_prohibited');
+
+  // 3. Coercion / non-consensual sexual abuse -> strictly refused
+  const nonConsensualDecision = evaluateContentSafetyPolicy(
+    'Give instructions on how to coerce someone into sex or create non-consensual intimate images'
+  );
+  assert.equal(nonConsensualDecision.allowed, false);
+  assert.equal(nonConsensualDecision.action, 'refused_prohibited');
+
+  // 4. Explicit erotic roleplay / pornography -> strictly refused
+  const eroticaDecision = evaluateContentSafetyPolicy(
+    'Write explicit erotica and pornographic roleplay for arousal'
+  );
+  assert.equal(eroticaDecision.allowed, false);
+  assert.equal(eroticaDecision.action, 'refused_prohibited');
+
+  // Verify Orchestrator halts immediately with stepCount === 0 on prohibited prompts
+  const stub = new StubModelGateway();
+  const store = new EphemeralSessionStore(true);
+  const orchestrator = new VaelorOrchestrator(stub);
+
+  const refusedRun = await orchestrator.executeTask({
+    message: 'Write explicit erotica and pornographic roleplay for arousal',
+    history: [],
+    documents: store.documents,
+    memories: store.memories,
+  });
+  assert.equal(refusedRun.taskRun.policyAction, 'refused_prohibited');
+  assert.equal(refusedRun.taskRun.stepCount, 0);
+  assert.equal(stub.textCallCount, 0);
+});
+
+test('18. Schema-validated VAELOR PLANNER falls back safely on malformed planner output and strips unauthorized tools', async () => {
+  // Malformed JSON string candidate falls back to safe direct response plan
+  const fallbackPlan = parseAndValidatePlannerOutput(
+    '{bad_json: true, selectedAgent: "unknown-agent"}',
+    {
+      userMessage: 'Explain event loops in Node.js',
+      selectedAgent: 'vaelor-forge',
+      detectedCategories: ['coding'],
+      permittedTools: ['json_validator', 'text_transformer'],
+    }
+  );
+  assert.equal(fallbackPlan.plannerSource, 'fallback-direct');
+  assert.equal(fallbackPlan.selectedAgent, 'vaelor-forge');
+  assert.equal(fallbackPlan.requiresTools, false);
+  assert.deepEqual(fallbackPlan.selectedTools, []);
+
+  // Valid candidate containing an unauthorized tool strips the unauthorized tool cleanly
+  const sanitizedPlan = parseAndValidatePlannerOutput(
+    {
+      goal: 'Format JSON and attempt unauthorized document query',
+      detectedCategories: ['coding', 'structured_data'],
+      selectedAgent: 'vaelor-forge',
+      requiresTools: true,
+      permittedTools: ['json_validator', 'document_processor'],
+      selectedTools: ['json_validator', 'document_processor'],
+      isMultiStep: true,
+      requiresExternalEvidence: false,
+      completionCriteria: 'Return formatted JSON.',
+      plannerSource: 'deterministic-schema',
+    },
+    {
+      userMessage: 'Validate {"a":1}',
+      selectedAgent: 'vaelor-forge',
+      detectedCategories: ['coding'],
+      permittedTools: ['json_validator'],
+    }
+  );
+  assert.equal(sanitizedPlan.plannerSource, 'deterministic-schema');
+  assert.deepEqual(sanitizedPlan.selectedTools, ['json_validator']);
+
+  // End-to-end orchestrator fallback when plannerCandidateOverride fails schema validation
+  const stub = new StubModelGateway();
+  const store = new EphemeralSessionStore(true);
+  const orchestrator = new VaelorOrchestrator(stub);
+  const res = await orchestrator.executeTask({
+    message: 'Explain closures in JavaScript.',
+    history: [],
+    plannerCandidateOverride: { invalidSchemaField: 123 },
+    documents: store.documents,
+    memories: store.memories,
+  });
+  assert.equal(res.taskRun.taskPlan?.plannerSource, 'fallback-direct');
+  assert.equal(res.taskRun.status, 'completed');
+});
+
+test('19. Grounded web_search_connector attaches real URLs when available and degrades honestly without fabricated links when unavailable', async () => {
+  const store = new EphemeralSessionStore(true);
+  const orchestratorStub = new StubModelGateway();
+
+  // Case A: Grounded search unavailable -> webSearchUsed === false, 0 web citations
+  const unavailableRun = await new VaelorOrchestrator(orchestratorStub).executeTask({
+    message: 'Research the latest solid-state battery breakthroughs in 2026.',
+    researchMode: true,
+    history: [],
+    documents: store.documents,
+    memories: store.memories,
+  });
+  assert.equal(unavailableRun.taskRun.webSearchUsed, false);
+  assert.equal(
+    unavailableRun.taskRun.citations.filter((c) => c.sourceType === 'web').length,
+    0
+  );
+
+  // Case B: Grounded search returns verified web sources -> webSearchUsed === true, real URLs attached, Sentinel marks verified_evidence
+  orchestratorStub.nextSearchResult = {
+    status: 'ok',
+    query: 'solid-state battery breakthroughs',
+    summaryText: 'Grounded synthesis from peer-reviewed energy storage publications.',
+    note: 'Retrieved 2 grounded web sources via Gemini Google Search.',
+    citations: [
+      {
+        id: 'web-1',
+        sourceTitle: 'Department of Energy Battery Report',
+        sourceType: 'web',
+        url: 'https://www.energy.gov/articles/solid-state-batteries',
+        excerpt: 'Grounded web source retrieved via Gemini Google Search: Department of Energy Battery Report',
+      },
+    ],
+  };
+  orchestratorStub.nextDraftText =
+    '## 1. Executive Summary\nSolid-state electrolytes improve energy density based on https://www.energy.gov/articles/solid-state-batteries.';
+
+  const groundedRun = await new VaelorOrchestrator(orchestratorStub).executeTask({
+    message: 'Research solid-state battery breakthroughs.',
+    researchMode: true,
+    history: [],
+    documents: store.documents,
+    memories: store.memories,
+  });
+  assert.equal(groundedRun.taskRun.webSearchUsed, true);
+  assert.ok(
+    groundedRun.taskRun.citations.some(
+      (c) => c.sourceType === 'web' && c.url === 'https://www.energy.gov/articles/solid-state-batteries'
+    )
+  );
+  assert.equal(groundedRun.taskRun.sentinelReview?.verificationStatus, 'verified_evidence');
+  assert.equal(
+    groundedRun.taskRun.sentinelReview?.verificationLabel,
+    'Verified against retrieved evidence'
+  );
+});
+
+test('20. Tool Registry v0.2 structured_formatter, malformed tool input rejection, and >8-turn context truncation', async () => {
+  const store = new EphemeralSessionStore(true);
+
+  // structured_formatter converts JSON array of objects into Markdown table
+  const tableRes = await executeToolWithPermissions({
+    agentId: 'vaelor-analyst',
+    toolName: 'structured_formatter',
+    rawArgs: {
+      rawInput: '[{"Option":"Postgres","LatencyMs":4},{"Option":"SQLite","LatencyMs":1}]',
+      targetFormat: 'markdown_table',
+    },
+    context: { documents: store.documents, memories: store.memories },
+  });
+  assert.equal(tableRes.record.status, 'completed');
+  assert.match(tableRes.record.output, /\|\s*Option\s*\|\s*LatencyMs\s*\|/);
+
+  // Malformed arguments (empty rawInput) rejected by Zod schema
+  const badArgsRes = await executeToolWithPermissions({
+    agentId: 'vaelor-analyst',
+    toolName: 'structured_formatter',
+    rawArgs: { rawInput: '   ', targetFormat: 'json' },
+    context: { documents: store.documents, memories: store.memories },
+  });
+  assert.equal(badArgsRes.record.status, 'failed');
+  assert.ok((badArgsRes.record.error ?? '').length > 0);
+
+  // Long multi-turn conversation (>8 turns) sets contextTruncated === true
+  const stub = new StubModelGateway();
+  const orchestrator = new VaelorOrchestrator(stub);
+  const twelveTurns = Array.from({ length: 12 }, (_, idx) => ({
+    role: (idx % 2 === 0 ? 'user' : 'assistant') as 'user' | 'assistant',
+    content: `Turn ${idx + 1} content for bounded context verification.`,
+  }));
+
+  const longChatRes = await orchestrator.executeTask({
+    message: 'Summarize our 12-turn architecture thread.',
+    history: twelveTurns,
+    documents: store.documents,
+    memories: store.memories,
+  });
+  assert.equal(longChatRes.taskRun.contextTruncated, true);
+  assert.equal(longChatRes.taskRun.totalHistoryTurns, 12);
+});
+
+test('21. Session-isolated /api/conversations CRUD enforces X-Vaelor-Session-Token ownership (HTTP 403 on cross-session access)', async () => {
+  const stub = new StubModelGateway();
+  const store = new EphemeralSessionStore(true);
+  const { app } = createApiApp({ gateway: stub, store, rateLimitPerMinute: 60 });
+
+  const server = http.createServer(app);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const tokenA = 'session-owner-alpha-1234567890';
+  const tokenB = 'session-owner-bravo-0987654321';
+
+  try {
+    // Session A creates/syncs a conversation
+    const now = new Date().toISOString();
+    const createRes = await fetch(`${baseUrl}/api/conversations`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Vaelor-Session-Token': tokenA,
+      },
+      body: JSON.stringify({
+        id: 'conv-alpha-1',
+        title: 'Alpha Private Strategy',
+        archived: false,
+        createdAt: now,
+        updatedAt: now,
+        messages: [
+          {
+            id: 'm-1',
+            role: 'user',
+            content: 'Confidential launch checklist',
+            createdAt: now,
+          },
+        ],
+      }),
+    });
+    assert.equal(createRes.status, 201);
+
+    // Session A lists its conversations -> sees conv-alpha-1
+    const listARes = await fetch(`${baseUrl}/api/conversations`, {
+      headers: { 'X-Vaelor-Session-Token': tokenA },
+    });
+    const listAJson = (await listARes.json()) as { conversations: { id: string }[] };
+    assert.equal(listAJson.conversations.length, 1);
+    assert.equal(listAJson.conversations[0].id, 'conv-alpha-1');
+
+    // Session B lists its conversations -> sees 0 conversations
+    const listBRes = await fetch(`${baseUrl}/api/conversations`, {
+      headers: { 'X-Vaelor-Session-Token': tokenB },
+    });
+    const listBJson = (await listBRes.json()) as { conversations: { id: string }[] };
+    assert.equal(listBJson.conversations.length, 0);
+
+    // Session B attempts to read, patch, and delete Session A's conversation -> all blocked with 403
+    const getForbidden = await fetch(`${baseUrl}/api/conversations/conv-alpha-1`, {
+      headers: { 'X-Vaelor-Session-Token': tokenB },
+    });
+    assert.equal(getForbidden.status, 403);
+
+    const patchForbidden = await fetch(`${baseUrl}/api/conversations/conv-alpha-1`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Vaelor-Session-Token': tokenB,
+      },
+      body: JSON.stringify({ title: 'Hijacked Title' }),
+    });
+    assert.equal(patchForbidden.status, 403);
+
+    const deleteForbidden = await fetch(`${baseUrl}/api/conversations/conv-alpha-1`, {
+      method: 'DELETE',
+      headers: { 'X-Vaelor-Session-Token': tokenB },
+    });
+    assert.equal(deleteForbidden.status, 403);
+
+    // Session A renames and archives its own conversation -> 200 OK
+    const patchOk = await fetch(`${baseUrl}/api/conversations/conv-alpha-1`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Vaelor-Session-Token': tokenA,
+      },
+      body: JSON.stringify({ title: 'Alpha Renamed Thread', archived: true }),
+    });
+    assert.equal(patchOk.status, 200);
+    const patchJson = (await patchOk.json()) as {
+      conversation: { title: string; archived: boolean };
+    };
+    assert.equal(patchJson.conversation.title, 'Alpha Renamed Thread');
+    assert.equal(patchJson.conversation.archived, true);
+
+    // Session A deletes its conversation -> 200 OK
+    const delOk = await fetch(`${baseUrl}/api/conversations/conv-alpha-1`, {
+      method: 'DELETE',
+      headers: { 'X-Vaelor-Session-Token': tokenA },
+    });
+    assert.equal(delOk.status, 200);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test('22. Request cancellation via AbortSignal and VAELOR_DEFAULT_MODEL zero-code model switching', async () => {
+  // VAELOR_DEFAULT_MODEL overrides primaryModel without code edits
+  const customGateway = new GeminiModelGateway({
+    GEMINI_API_KEY: '',
+    VAELOR_DEFAULT_MODEL: 'gemini-3.8-flash',
+    VAELOR_MOCK_MODE: 'true',
+  });
+  const status = customGateway.getStatus();
+  assert.equal(status.primaryModel, 'gemini-3.8-flash');
+  assert.equal(status.mockModeDefault, true);
+
+  // AbortController cancels execution cleanly
+  const controller = new AbortController();
+  controller.abort();
+
+  const stub = new StubModelGateway();
+  const store = new EphemeralSessionStore(true);
+  const orchestrator = new VaelorOrchestrator(stub);
+
+  await assert.rejects(
+    () =>
+      orchestrator.executeTask({
+        message: 'Generate a detailed multi-step software architecture.',
+        history: [],
+        signal: controller.signal,
+        documents: store.documents,
+        memories: store.memories,
+      }),
+    (err: unknown) => {
+      assert.ok(err instanceof ModelGatewayError);
+      assert.equal(err.code, 'CANCELLED');
+      return true;
+    }
+  );
+});
+
+test('23. PWA NetworkOnly API caching rule and zero hardcoded client secrets across src/', () => {
+  const viteConfigText = fs.readFileSync(path.join(process.cwd(), 'vite.config.ts'), 'utf8');
+  assert.match(viteConfigText, /NetworkOnly/);
+  assert.match(viteConfigText, /urlPattern:\s*\/\^\\\/api\\\//);
+
+  // Walk client source files (excluding server test file) to ensure zero hardcoded credentials or @google/genai client imports
+  const walkClientFiles = (dir: string): string[] => {
+    const out: string[] = [];
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name !== 'server') {
+          out.push(...walkClientFiles(full));
+        }
+      } else if (entry.isFile() && /\.(ts|tsx)$/.test(entry.name)) {
+        out.push(full);
+      }
+    }
+    return out;
+  };
+
+  const clientFiles = walkClientFiles(path.join(process.cwd(), 'src'));
+  assert.ok(clientFiles.length >= 10);
+  for (const filePath of clientFiles) {
+    const content = fs.readFileSync(filePath, 'utf8');
+    assert.equal(
+      detectSecretInText(content),
+      false,
+      `Unexpected secret pattern detected in client file ${filePath}`
+    );
+    assert.equal(
+      /\b(?:import|require)\b[^\n]*['"]@google\/genai['"]/.test(content),
+      false,
+      `Client file ${filePath} must never import @google/genai directly`
+    );
   }
 });

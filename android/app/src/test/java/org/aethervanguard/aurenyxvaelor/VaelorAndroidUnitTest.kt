@@ -30,6 +30,7 @@ class VaelorAndroidUnitTest {
         )
         assertEquals("The Aether Vanguard", OfficialAttribution.FOUNDER_ORGANIZATION)
         assertEquals("Arenyx Sol Kael", OfficialAttribution.FOUNDER_NAME)
+        assertEquals("0.2.0", OfficialAttribution.VERSION)
     }
 
     @Test
@@ -76,6 +77,15 @@ class VaelorAndroidUnitTest {
             val reloaded = store.loadConversations()
             assertEquals(1, reloaded.size)
             assertEquals("Plan a Kotlin coroutine architecture", reloaded.first().messages.first().content)
+
+            val afterRename = store.renameConversation("conv-1", "Kotlin Coroutine Blueprint", nowEpochMs = 2000L)
+            assertEquals("Kotlin Coroutine Blueprint", afterRename.first().title)
+
+            val afterArchive = store.setArchived("conv-1", true, nowEpochMs = 3000L)
+            assertTrue(afterArchive.first().archived)
+
+            val afterUnarchive = store.setArchived("conv-1", false, nowEpochMs = 4000L)
+            assertFalse(afterUnarchive.first().archived)
 
             val afterWipe = store.wipeAllPrivateHistory()
             assertTrue(afterWipe.isEmpty())

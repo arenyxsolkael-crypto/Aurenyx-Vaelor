@@ -4,7 +4,7 @@ import kotlinx.serialization.Serializable
 
 object OfficialAttribution {
     const val PRODUCT_NAME = "AURENYX VAELOR"
-    const val VERSION = "0.1.0"
+    const val VERSION = "0.2.0"
     const val TAGLINE = "Intelligence, Orchestrated."
     const val FOUNDER_ORGANIZATION = "The Aether Vanguard"
     const val FOUNDER_NAME = "Arenyx Sol Kael"
@@ -27,6 +27,9 @@ data class ChatRequestDto(
     val preferredAgent: String? = null,
     val useSentinel: Boolean = true,
     val researchMode: Boolean = false,
+    val tone: String? = null,
+    val responseLength: String? = null,
+    val mockMode: Boolean = false,
     val conversationId: String? = null
 )
 
@@ -44,13 +47,16 @@ data class CitationDto(
     val id: String = "",
     val sourceTitle: String = "",
     val sourceType: String = "",
-    val excerpt: String = ""
+    val excerpt: String = "",
+    val url: String? = null
 )
 
 @Serializable
 data class SentinelReviewDto(
     val approved: Boolean = true,
     val status: String = "verified",
+    val verificationStatus: String? = null,
+    val verificationLabel: String? = null,
     val flags: List<String> = emptyList(),
     val summary: String = ""
 )
@@ -109,7 +115,8 @@ data class PrivateConversation(
     val id: String,
     val title: String,
     val messages: List<LocalChatMessage> = emptyList(),
-    val updatedAtEpochMs: Long
+    val updatedAtEpochMs: Long,
+    val archived: Boolean = false
 )
 
 @Serializable
