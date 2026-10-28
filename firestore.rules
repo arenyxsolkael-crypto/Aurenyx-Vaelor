@@ -37,6 +37,13 @@ service cloud.firestore {
         get(/databases/$(database)/documents/users/$(userId)).data.ownerId == request.auth.uid;
     }
 
+    function hasValidOptionalProjectRef(userId, projectId) {
+      return projectId == '' || (
+        exists(/databases/$(database)/documents/users/$(userId)/projects/$(projectId)) &&
+        get(/databases/$(database)/documents/users/$(userId)/projects/$(projectId)).data.ownerId == request.auth.uid
+      );
+    }
+
     // Blueprint Validation Helpers (Synced verbatim with firebase-blueprint.json; Auth check first)
     function isValidUserProfile(data) {
       return isSignedIn() &&
@@ -116,6 +123,48 @@ service cloud.firestore {
         data.category is string &&
         data.category.size() <= 24 &&
         (data.category == 'preference' || data.category == 'project-fact' || data.category == 'constraint' || data.category == 'note') &&
+        data.memoryType is string &&
+        data.memoryType.size() <= 16 &&
+        (data.memoryType == 'note' || data.memoryType == 'decision' || data.memoryType == 'goal' || data.memoryType == 'summary' || data.memoryType == 'reference') &&
+        data.projectId is string &&
+        data.projectId.size() <= 128 &&
+        data.projectId.matches('^$|^[a-zA-Z0-9_\\-]+$') &&
+        data.referenceUrl is string &&
+        data.referenceUrl.size() <= 500 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidCloudMission(data) {
+      return isSignedIn() &&
+        data.ownerId is string &&
+        data.ownerId.size() >= 1 &&
+        data.ownerId.size() <= 128 &&
+        data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.ownerId == request.auth.uid &&
+        data.title is string &&
+        data.title.size() >= 2 &&
+        data.title.size() <= 120 &&
+        data.objective is string &&
+        data.objective.size() >= 4 &&
+        data.objective.size() <= 2000 &&
+        data.projectId is string &&
+        data.projectId.size() <= 128 &&
+        data.projectId.matches('^$|^[a-zA-Z0-9_\\-]+$') &&
+        data.status is string &&
+        data.status.size() <= 24 &&
+        (data.status == 'planned' || data.status == 'awaiting_approval' || data.status == 'running' || data.status == 'paused' || data.status == 'completed' || data.status == 'blocked' || data.status == 'failed' || data.status == 'cancelled') &&
+        data.stepsUsed is int &&
+        data.stepsUsed >= 0 &&
+        data.stepsUsed <= 20 &&
+        data.maxSteps is int &&
+        data.maxSteps >= 1 &&
+        data.maxSteps <= 20 &&
+        data.modelCallsUsed is int &&
+        data.modelCallsUsed >= 0 &&
+        data.modelCallsUsed <= 20 &&
+        data.summary is string &&
+        data.summary.size() <= 2400 &&
         data.createdAt is timestamp &&
         data.updatedAt is timestamp;
     }
@@ -245,7 +294,7 @@ service cloud.firestore {
           existing().ownerId == request.auth.uid;
       }
 
-      // 4. User-Owned Cloud Memories
+      // 4. User-Owned Cloud Memories (Project-Scoped or Global)
       match /memories/{memoryId} {
         allow get: if isOwner(userId) &&
           isValidId(userId) &&
@@ -261,11 +310,12 @@ service cloud.firestore {
           isValidId(userId) &&
           isValidId(memoryId) &&
           isValidCloudMemory(incoming()) &&
-          incoming().keys().hasAll(['ownerId', 'label', 'content', 'category', 'createdAt', 'updatedAt']) &&
-          incoming().keys().hasOnly(['ownerId', 'label', 'content', 'category', 'createdAt', 'updatedAt']) &&
+          incoming().keys().hasAll(['ownerId', 'label', 'content', 'category', 'memoryType', 'projectId', 'referenceUrl', 'createdAt', 'updatedAt']) &&
+          incoming().keys().hasOnly(['ownerId', 'label', 'content', 'category', 'memoryType', 'projectId', 'referenceUrl', 'createdAt', 'updatedAt']) &&
           incoming().createdAt == request.time &&
           incoming().updatedAt == request.time &&
-          hasValidParentUser(userId);
+          hasValidParentUser(userId) &&
+          hasValidOptionalProjectRef(userId, incoming().projectId);
 
         allow update: if isValidCloudMemory(incoming()) &&
           isVerifiedUser() &&
@@ -273,15 +323,72 @@ service cloud.firestore {
           isValidId(userId) &&
           isValidId(memoryId) &&
           incoming().ownerId == existing().ownerId &&
+          incoming().projectId == existing().projectId &&
           incoming().createdAt == existing().createdAt &&
           incoming().updatedAt == request.time &&
-          incoming().diff(existing()).affectedKeys().hasOnly(['label', 'content', 'category', 'updatedAt']) &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['label', 'content', 'category', 'memoryType', 'referenceUrl', 'updatedAt']) &&
           hasValidParentUser(userId);
 
         allow delete: if isVerifiedUser() &&
           isOwner(userId) &&
           isValidId(userId) &&
           isValidId(memoryId) &&
+          existing().ownerId == request.auth.uid;
+      }
+
+      // 5. User-Owned Cloud Missions (with Terminal State Locking on 'completed' & 'cancelled')
+      match /missions/{missionId} {
+        allow get: if isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(missionId) &&
+          existing().ownerId == request.auth.uid &&
+          hasValidParentUser(userId);
+
+        allow list: if isOwner(userId) &&
+          resource.data.ownerId == request.auth.uid;
+
+        allow create: if isVerifiedUser() &&
+          isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(missionId) &&
+          isValidCloudMission(incoming()) &&
+          incoming().keys().hasAll(['ownerId', 'title', 'objective', 'projectId', 'status', 'stepsUsed', 'maxSteps', 'modelCallsUsed', 'summary', 'createdAt', 'updatedAt']) &&
+          incoming().keys().hasOnly(['ownerId', 'title', 'objective', 'projectId', 'status', 'stepsUsed', 'maxSteps', 'modelCallsUsed', 'summary', 'createdAt', 'updatedAt']) &&
+          incoming().status != 'completed' &&
+          incoming().status != 'cancelled' &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          hasValidParentUser(userId) &&
+          hasValidOptionalProjectRef(userId, incoming().projectId);
+
+        allow update: if isValidCloudMission(incoming()) &&
+          isVerifiedUser() &&
+          isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(missionId) &&
+          existing().status != 'completed' &&
+          existing().status != 'cancelled' &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().projectId == existing().projectId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          (
+            (
+              incoming().status != 'completed' &&
+              incoming().status != 'cancelled' &&
+              incoming().diff(existing()).affectedKeys().hasOnly(['title', 'status', 'stepsUsed', 'modelCallsUsed', 'summary', 'updatedAt'])
+            ) ||
+            (
+              (incoming().status == 'completed' || incoming().status == 'cancelled') &&
+              incoming().diff(existing()).affectedKeys().hasOnly(['status', 'stepsUsed', 'modelCallsUsed', 'summary', 'updatedAt'])
+            )
+          ) &&
+          hasValidParentUser(userId);
+
+        allow delete: if isVerifiedUser() &&
+          isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(missionId) &&
           existing().ownerId == request.auth.uid;
       }
     }

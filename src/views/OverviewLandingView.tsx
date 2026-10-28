@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { ArrowRight, LogIn, Play, ShieldCheck } from 'lucide-react';
 import { OFFICIAL_ATTRIBUTION } from '../shared/types';
@@ -89,6 +89,11 @@ export const OverviewLandingView: React.FC = () => {
     }
   };
 
+  useEffect(() => {
+    void runLiveDemo();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const handleLaunchWorkspace = (seedPrompt?: string) => {
     if (seedPrompt) {
       startNewConversation(seedPrompt);
@@ -120,10 +125,10 @@ export const OverviewLandingView: React.FC = () => {
               </p>
 
               <p className="max-w-xl text-base leading-relaxed text-[#a8a1bd]">
-                AURENYX VAELOR v0.3 routes complex work across specialized AI role profiles,
-                validates 14 server-side tools including static code inspection, manages reusable
-                project briefs, and audits answers with Vaelor Sentinel—engineered for an
-                Android-first, ₹0 free-tier workflow.
+                AURENYX VAELOR v0.4 coordinates Mission Control DAG workflows, project-isolated
+                memory, 7-stage deep research, the Aether Vanguard Council, a non-executing Coding
+                Lab, and Sentinel epistemic verification—engineered for an Android-first, ₹0
+                free-tier workflow.
               </p>
             </div>
 
@@ -287,13 +292,20 @@ export const OverviewLandingView: React.FC = () => {
               )}
 
               {demoSvg && (
-                <div className="overflow-hidden rounded-xl border border-white/10 bg-[#0e0c16] p-2">
-                  <img
-                    src={`data:image/svg+xml;utf8,${encodeURIComponent(demoSvg)}`}
-                    alt="Interactive demo SVG chart output"
-                    referrerPolicy="no-referrer"
-                    className="mx-auto max-h-[210px] w-auto"
-                  />
+                <div className="space-y-2">
+                  <div className="overflow-hidden rounded-xl border border-white/10 bg-[#0e0c16] p-2">
+                    <img
+                      src={`data:image/svg+xml;utf8,${encodeURIComponent(demoSvg)}`}
+                      alt="Interactive demo SVG chart output"
+                      referrerPolicy="no-referrer"
+                      className="mx-auto max-h-[210px] w-auto"
+                    />
+                  </div>
+                  {demoOutput && (
+                    <p className="font-mono text-[11px] tabular-nums text-[#a59ec0]">
+                      {demoOutput}
+                    </p>
+                  )}
                 </div>
               )}
 

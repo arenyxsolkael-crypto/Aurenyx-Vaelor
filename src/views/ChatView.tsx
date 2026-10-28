@@ -554,6 +554,12 @@ const MessageItem: React.FC<{
                 )}
                 <span>·</span>
                 <span>Model: {run.modelUsed || 'gemini-3.1-flash-lite'}</span>
+                {run.routeDecision && (
+                  <>
+                    <span>·</span>
+                    <span>Router: {run.routeDecision.operatingMode}</span>
+                  </>
+                )}
                 <span>·</span>
                 <span>
                   Permitted tools:{' '}
@@ -583,6 +589,39 @@ const MessageItem: React.FC<{
                     Vaelor Sentinel Verification ({run.sentinelReview.status})
                   </p>
                   <p className="text-[#a9a2be]">{run.sentinelReview.summary}</p>
+                  {run.sentinelReview.incompleteEvidenceWarning && (
+                    <p className="text-[11px] text-amber-200/90">
+                      Warning: {run.sentinelReview.incompleteEvidenceWarning}
+                    </p>
+                  )}
+                  {(Boolean(run.sentinelReview.verifiedFacts?.length) ||
+                    Boolean(run.sentinelReview.plausibleInferences?.length) ||
+                    Boolean(run.sentinelReview.unknowns?.length)) && (
+                    <div className="space-y-1 pt-0.5 text-[11px] text-[#b8b1cc]">
+                      {run.sentinelReview.verifiedFacts &&
+                        run.sentinelReview.verifiedFacts.length > 0 && (
+                          <p>
+                            <span className="font-medium text-emerald-300">Verified facts:</span>{' '}
+                            {run.sentinelReview.verifiedFacts.join(' · ')}
+                          </p>
+                        )}
+                      {run.sentinelReview.plausibleInferences &&
+                        run.sentinelReview.plausibleInferences.length > 0 && (
+                          <p>
+                            <span className="font-medium text-[#c5b3fc]">
+                              Plausible inferences:
+                            </span>{' '}
+                            {run.sentinelReview.plausibleInferences.join(' · ')}
+                          </p>
+                        )}
+                      {run.sentinelReview.unknowns && run.sentinelReview.unknowns.length > 0 && (
+                        <p>
+                          <span className="font-medium text-amber-200">Open unknowns:</span>{' '}
+                          {run.sentinelReview.unknowns.join(' · ')}
+                        </p>
+                      )}
+                    </div>
+                  )}
                   {run.sentinelReview.flags.length > 0 && (
                     <ul className="space-y-1 text-amber-200/90">
                       {run.sentinelReview.flags.map((flag, idx) => (
@@ -748,7 +787,8 @@ export const ChatView: React.FC = () => {
       file.type === 'image/png' ||
       file.type === 'image/jpeg' ||
       file.type === 'image/webp' ||
-      /\.(png|jpe?g|webp)$/.test(lower);
+      file.type === 'image/gif' ||
+      /\.(png|jpe?g|webp|gif)$/.test(lower);
 
     const isText =
       file.type.startsWith('text/') ||
@@ -757,7 +797,7 @@ export const ChatView: React.FC = () => {
 
     if (!isImage && !isText) {
       setAttachmentNotice(
-        'Supported attachments: .txt, .md, .csv, .json, and PNG/JPEG/WEBP images (up to 1 MB).'
+        'Supported attachments: .txt, .md, .csv, .json, and PNG/JPEG/WEBP/GIF images (up to 1 MB).'
       );
       return;
     }
@@ -1168,7 +1208,7 @@ export const ChatView: React.FC = () => {
             <input
               ref={fileInputRef}
               type="file"
-              accept=".txt,.md,.csv,.json,image/png,image/jpeg,image/webp"
+              accept=".txt,.md,.csv,.json,image/png,image/jpeg,image/webp,image/gif"
               onChange={(e) => void handleFileChange(e)}
               className="hidden"
             />

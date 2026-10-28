@@ -183,9 +183,9 @@ export const AuthView: React.FC<AuthViewProps> = ({ protectedFeatureLabel }) => 
                   : 'Sign in to your private Vaelor workspace'}
               </h1>
               <p className="text-sm leading-relaxed text-[#a8a1bd]">
-                Your projects, conversation threads, indexed documents, saved memories, and task
-                logs are isolated strictly to your verified account UID. Public product overviews
-                remain open without sign-in.
+                Your projects, Mission Control DAGs, deep research reports, council sessions,
+                conversation threads, saved memories, and task logs are isolated strictly to your
+                verified account UID. Public product overviews remain open without sign-in.
               </p>
             </div>
 

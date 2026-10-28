@@ -52,6 +52,8 @@ export const SettingsView: React.FC = () => {
     memories,
     projects,
     tasks,
+    missions,
+    routerStatus,
     purgeSessionData,
   } = useWorkspace();
 
@@ -85,7 +87,7 @@ export const SettingsView: React.FC = () => {
   };
 
   const handlePurge = async (
-    scope: 'conversations' | 'memories' | 'documents' | 'tasks' | 'all',
+    scope: 'conversations' | 'memories' | 'documents' | 'tasks' | 'missions' | 'all',
     label: string
   ) => {
     await purgeSessionData(scope);
@@ -620,6 +622,15 @@ export const SettingsView: React.FC = () => {
           </div>
 
           <div className="flex items-center justify-between py-3">
+            <span className="text-[#a59ec0]">Adaptive Model Router</span>
+            <span className="font-mono text-[#e4dff2]">
+              {routerStatus
+                ? `${routerStatus.operatingMode} (${routerStatus.distinctModelsConfigured ? 'Multi-Model' : 'Shared Single-Model'})`
+                : 'single-model'}
+            </span>
+          </div>
+
+          <div className="flex items-center justify-between py-3">
             <span className="text-[#a59ec0]">Execution & Rate Ceilings</span>
             <span className="font-mono tabular-nums text-[#e4dff2]">
               Max {health?.maxStepsPerRequest ?? 4} calls/task ·{' '}
@@ -628,6 +639,10 @@ export const SettingsView: React.FC = () => {
             </span>
           </div>
         </div>
+
+        {routerStatus?.disclosureNote && (
+          <p className="text-xs leading-relaxed text-[#958ea8]">{routerStatus.disclosureNote}</p>
+        )}
       </section>
 
       {/* 4. Privacy & Per-User Data Purge Controls */}
@@ -711,6 +726,22 @@ export const SettingsView: React.FC = () => {
               className="min-h-[40px] rounded-lg border border-white/10 px-3 py-1.5 text-xs text-[#cfc8e2] hover:border-rose-500/40 hover:text-rose-300"
             >
               Clear Logs
+            </button>
+          </div>
+
+          <div className="flex items-center justify-between rounded-xl border border-white/8 bg-[#0e0c16] p-3.5">
+            <div>
+              <p className="text-xs font-semibold text-[#f1eef9]">Mission Control Runs</p>
+              <p className="font-mono text-xs tabular-nums text-[#958ea8]">
+                {missions.length} saved missions
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => void handlePurge('missions', 'Mission Control runs')}
+              className="min-h-[40px] rounded-lg border border-white/10 px-3 py-1.5 text-xs text-[#cfc8e2] hover:border-rose-500/40 hover:text-rose-300"
+            >
+              Clear
             </button>
           </div>
         </div>

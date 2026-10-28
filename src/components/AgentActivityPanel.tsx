@@ -25,8 +25,15 @@ const AGENT_ICONS: Record<AgentId, React.ComponentType<{ className?: string }>> 
 };
 
 export const AgentActivityPanel: React.FC<AgentActivityPanelProps> = ({ onCloseMobile }) => {
-  const { agents, activeStage, isSending, tasks, preferredAgent, setPreferredAgent } =
-    useWorkspace();
+  const {
+    agents,
+    activeStage,
+    isSending,
+    tasks,
+    preferredAgent,
+    setPreferredAgent,
+    routerStatus,
+  } = useWorkspace();
 
   const latestTask = tasks[0];
 
@@ -59,6 +66,7 @@ export const AgentActivityPanel: React.FC<AgentActivityPanelProps> = ({ onCloseM
             <span>Pipeline State</span>
             <span className="font-mono tabular-nums text-[#cfc8e2]">
               {isSending ? 'Running' : 'Standby'}
+              {routerStatus ? ` · Router: ${routerStatus.operatingMode}` : ''}
             </span>
           </div>
           <p className="mt-1.5 text-xs font-medium leading-relaxed text-[#f1eef9]">{activeStage}</p>
@@ -131,12 +139,23 @@ export const AgentActivityPanel: React.FC<AgentActivityPanelProps> = ({ onCloseM
                 {latestTask.agentName} · {latestTask.status}
               </p>
               {latestTask.sentinelReview && (
-                <p className="text-[11px] leading-relaxed text-[#a9a2bc]">
-                  {latestTask.sentinelReview.verificationLabel
-                    ? `${latestTask.sentinelReview.verificationLabel}: `
-                    : 'Sentinel: '}
-                  {latestTask.sentinelReview.summary}
-                </p>
+                <div className="space-y-1">
+                  <p className="text-[11px] leading-relaxed text-[#a9a2bc]">
+                    {latestTask.sentinelReview.verificationLabel
+                      ? `${latestTask.sentinelReview.verificationLabel}: `
+                      : 'Sentinel: '}
+                    {latestTask.sentinelReview.summary}
+                  </p>
+                  {(latestTask.sentinelReview.verifiedFacts ||
+                    latestTask.sentinelReview.plausibleInferences ||
+                    latestTask.sentinelReview.unknowns) && (
+                    <p className="font-mono text-[11px] tabular-nums text-[#8f88a3]">
+                      Facts: {latestTask.sentinelReview.verifiedFacts?.length ?? 0} · Inferences:{' '}
+                      {latestTask.sentinelReview.plausibleInferences?.length ?? 0} · Unknowns:{' '}
+                      {latestTask.sentinelReview.unknowns?.length ?? 0}
+                    </p>
+                  )}
+                </div>
               )}
               {latestTask.toolCalls.length > 0 && (
                 <p className="text-[11px] text-[#9e97b0]">

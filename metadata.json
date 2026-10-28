@@ -1,6 +1,6 @@
 {
   "name": "Aurenyx Vaelor",
-  "description": "Intelligence, Orchestrated. AURENYX VAELOR — Founded by The Aether Vanguard, founded by Arenyx Sol Kael. A modular, mobile-first multi-agent AI intelligence and workflow platform.",
+  "description": "Intelligence, Orchestrated. AURENYX VAELOR v0.4 — Founded by The Aether Vanguard, founded by Arenyx Sol Kael. Modular AI workspace with Mission Control, Project Memory, Deep Research, Vanguard Council, Coding Lab, and TrustGrid.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

@@ -21,7 +21,7 @@ import {
   where,
 } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
-import type { ProjectWorkspace, SavedMemory } from '../shared/types';
+import type { MissionRun, ProjectWorkspace, SavedMemory } from '../shared/types';
 
 const app = getApps().length > 0 ? getApps()[0] : initializeApp(firebaseConfig);
 
@@ -52,6 +52,12 @@ export const BLUEPRINT_CONSTRAINTS = {
   MEMORY_LABEL_MAX_LEN: 80,
   MEMORY_CONTENT_MIN_LEN: 2,
   MEMORY_CONTENT_MAX_LEN: 1200,
+  MEMORY_REF_URL_MAX_LEN: 500,
+  MISSION_TITLE_MIN_LEN: 2,
+  MISSION_TITLE_MAX_LEN: 120,
+  MISSION_OBJECTIVE_MIN_LEN: 4,
+  MISSION_OBJECTIVE_MAX_LEN: 2000,
+  MISSION_SUMMARY_MAX_LEN: 2400,
 } as const;
 
 export enum OperationType {
@@ -124,6 +130,18 @@ void testFirestoreConnectionOnce();
 function sanitizeFirestoreId(rawId: string): string {
   const cleaned = rawId.trim().replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, BLUEPRINT_CONSTRAINTS.ID_MAX_LEN);
   return cleaned || 'item_default';
+}
+
+async function resolveVerifiedCloudProjectId(user: User, rawProjectId?: string): Promise<string> {
+  if (!rawProjectId || !rawProjectId.trim()) return '';
+  const safeProjectId = sanitizeFirestoreId(rawProjectId);
+  const projectPath = `users/${user.uid}/projects/${safeProjectId}`;
+  try {
+    const snap = await getDoc(doc(db, 'users', user.uid, 'projects', safeProjectId));
+    return snap.exists() ? safeProjectId : '';
+  } catch (err) {
+    handleFirestoreError(err, OperationType.GET, projectPath);
+  }
 }
 
 /**
@@ -344,6 +362,11 @@ export async function syncCloudMemoryToFirestore(
     return;
   }
 
+  const memoryType = memory.memoryType ?? 'note';
+  const referenceUrl = (memory.referenceUrl || '')
+    .trim()
+    .slice(0, BLUEPRINT_CONSTRAINTS.MEMORY_REF_URL_MAX_LEN);
+
   let exists = false;
   try {
     const snap = await getDoc(ref);
@@ -354,11 +377,15 @@ export async function syncCloudMemoryToFirestore(
 
   try {
     if (!exists) {
+      const projectId = await resolveVerifiedCloudProjectId(user, memory.projectId);
       await setDoc(ref, {
         ownerId: user.uid,
         label,
         content,
         category: memory.category,
+        memoryType,
+        projectId,
+        referenceUrl,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
@@ -367,6 +394,8 @@ export async function syncCloudMemoryToFirestore(
         label,
         content,
         category: memory.category,
+        memoryType,
+        referenceUrl,
         updatedAt: serverTimestamp(),
       });
     }
@@ -395,6 +424,120 @@ export async function deleteCloudMemoryFromFirestore(
   }
 }
 
+export async function syncCloudMissionToFirestore(
+  user: User,
+  mission: MissionRun
+): Promise<void> {
+  if (!user.emailVerified || !BLUEPRINT_CONSTRAINTS.ID_PATTERN.test(user.uid)) {
+    return;
+  }
+  const missionId = sanitizeFirestoreId(mission.id);
+  const path = `users/${user.uid}/missions/${missionId}`;
+  const ref = doc(db, 'users', user.uid, 'missions', missionId);
+
+  const title = mission.title.trim().slice(0, BLUEPRINT_CONSTRAINTS.MISSION_TITLE_MAX_LEN);
+  const objective = mission.objective.trim().slice(0, BLUEPRINT_CONSTRAINTS.MISSION_OBJECTIVE_MAX_LEN);
+  if (
+    title.length < BLUEPRINT_CONSTRAINTS.MISSION_TITLE_MIN_LEN ||
+    objective.length < BLUEPRINT_CONSTRAINTS.MISSION_OBJECTIVE_MIN_LEN
+  ) {
+    return;
+  }
+
+  const stepsUsed = Math.max(0, Math.min(20, Math.round(mission.bounds.stepsUsed)));
+  const maxSteps = Math.max(1, Math.min(20, Math.round(mission.bounds.maxSteps)));
+  const modelCallsUsed = Math.max(0, Math.min(20, Math.round(mission.bounds.modelCallsUsed)));
+  const summary = (mission.finalSummary || mission.sentinelReview?.summary || '')
+    .trim()
+    .slice(0, BLUEPRINT_CONSTRAINTS.MISSION_SUMMARY_MAX_LEN);
+
+  let existingStatus: string | null = null;
+  try {
+    const snap = await getDoc(ref);
+    if (snap.exists()) {
+      existingStatus = String(snap.data()?.status || 'planned');
+    }
+  } catch (err) {
+    handleFirestoreError(err, OperationType.GET, path);
+  }
+
+  if (existingStatus === 'completed' || existingStatus === 'cancelled') {
+    return;
+  }
+
+  try {
+    if (!existingStatus) {
+      const projectId = await resolveVerifiedCloudProjectId(user, mission.projectId);
+      const isTerminal = mission.status === 'completed' || mission.status === 'cancelled';
+      await setDoc(ref, {
+        ownerId: user.uid,
+        title,
+        objective,
+        projectId,
+        status: isTerminal ? 'running' : mission.status,
+        stepsUsed,
+        maxSteps,
+        modelCallsUsed,
+        summary,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      if (isTerminal) {
+        await updateDoc(ref, {
+          status: mission.status,
+          stepsUsed,
+          modelCallsUsed,
+          summary,
+          updatedAt: serverTimestamp(),
+        });
+      }
+    } else if (mission.status === 'completed' || mission.status === 'cancelled') {
+      await updateDoc(ref, {
+        status: mission.status,
+        stepsUsed,
+        modelCallsUsed,
+        summary,
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      await updateDoc(ref, {
+        title,
+        status: mission.status,
+        stepsUsed,
+        modelCallsUsed,
+        summary,
+        updatedAt: serverTimestamp(),
+      });
+    }
+  } catch (err) {
+    handleFirestoreError(
+      err,
+      existingStatus ? OperationType.UPDATE : OperationType.CREATE,
+      path
+    );
+  }
+}
+
+export async function deleteCloudMissionFromFirestore(
+  user: User,
+  missionIdRaw: string
+): Promise<void> {
+  if (!user.emailVerified || !BLUEPRINT_CONSTRAINTS.ID_PATTERN.test(user.uid)) {
+    return;
+  }
+  const missionId = sanitizeFirestoreId(missionIdRaw);
+  const path = `users/${user.uid}/missions/${missionId}`;
+  const ref = doc(db, 'users', user.uid, 'missions', missionId);
+  try {
+    const snap = await getDoc(ref);
+    if (snap.exists()) {
+      await deleteDoc(ref);
+    }
+  } catch (err) {
+    handleFirestoreError(err, OperationType.DELETE, path);
+  }
+}
+
 /**
  * Deletes all Firestore subcollection records before removing the parent /users/{uid} profile
  * during account cancellation.
@@ -404,18 +547,18 @@ export async function deleteAllUserFirestoreData(user: User): Promise<void> {
     return;
   }
 
-  const projectsPath = `users/${user.uid}/projects`;
+  const missionsPath = `users/${user.uid}/missions`;
   try {
-    const projQuery = query(
-      collection(db, 'users', user.uid, 'projects'),
+    const msnQuery = query(
+      collection(db, 'users', user.uid, 'missions'),
       where('ownerId', '==', user.uid)
     );
-    const projSnaps = await getDocs(projQuery);
-    for (const d of projSnaps.docs) {
+    const msnSnaps = await getDocs(msnQuery);
+    for (const d of msnSnaps.docs) {
       await deleteDoc(d.ref);
     }
   } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, projectsPath);
+    handleFirestoreError(err, OperationType.DELETE, missionsPath);
   }
 
   const memoriesPath = `users/${user.uid}/memories`;
@@ -430,6 +573,20 @@ export async function deleteAllUserFirestoreData(user: User): Promise<void> {
     }
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, memoriesPath);
+  }
+
+  const projectsPath = `users/${user.uid}/projects`;
+  try {
+    const projQuery = query(
+      collection(db, 'users', user.uid, 'projects'),
+      where('ownerId', '==', user.uid)
+    );
+    const projSnaps = await getDocs(projQuery);
+    for (const d of projSnaps.docs) {
+      await deleteDoc(d.ref);
+    }
+  } catch (err) {
+    handleFirestoreError(err, OperationType.DELETE, projectsPath);
   }
 
   const privatePath = `users/${user.uid}/private/account`;

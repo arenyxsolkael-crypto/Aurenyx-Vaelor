@@ -33,44 +33,44 @@ const TRUSTGRID_PRINCIPLES = [
 
 const CAPABILITY_AUDIT = [
   {
-    item: '01. Autonomous Intelligence Workspace & Multi-Agent Orchestrator (v0.3)',
+    item: '01. Mission Control & Dependency-Aware DAG Orchestration (v0.4)',
     status: 'Implemented',
-    notes: '6 structured role profiles (Core, Vaelor Research, Forge, Analyst, Knowledge, Sentinel), loop-guarded DRAFT → VERIFY lifecycle, approval-gated workflows, and Local Mock Mode.',
+    notes: 'Dependency-ordered subtasks, proposed vs. executed distinction, human approval gates for consequential steps, pause/resume/cancel/retry, and strict step/time/call bounds.',
   },
   {
-    item: '02. Permissioned 14-Tool Gateway & Non-Executing Static Code Reviewer',
+    item: '02. Project-Isolated Memory & Context Injection Controls',
     status: 'Implemented',
-    notes: '14 Zod-validated tools including code_static_reviewer, safe math, CSV stats, SVG charts, and 12k-char output caps; zero shell or arbitrary code execution.',
+    notes: 'Per-project memory isolation (zero cross-project leakage), approved note/decision/goal/summary/reference items, global + per-project injection toggles, and JSON export.',
   },
   {
-    item: '03. Project Workspaces, Approved Summaries & JSON Export',
+    item: '03. 7-Stage Deep Research & Claim-to-Source Matrix',
     status: 'Implemented',
-    notes: 'Reusable project briefs, concise task plans, explicit user-saved chat summaries, and portable JSON workspace bundles.',
+    notes: 'Clarification, grounded search, source collection, comparison, synthesis, verification, and final report with source URLs, access dates, and unsupported-claim flags.',
   },
   {
-    item: '04. Aurenyx TrustGrid Governance & Passport Suite',
+    item: '04. Aether Vanguard Council & Adaptive Model Router',
     status: 'Implemented',
-    notes: '15-question assessment, deterministic provisional risk rules, 8+ test scenarios, 12 safeguard categories, TXT/JSON/Print Passport exports.',
+    notes: 'Researcher, Engineer, Strategist, and Skeptical Reviewer roles with explicit single- vs. multi-model honesty disclosure, call budgets, and ₹0 cost guardrails.',
   },
   {
-    item: '05. Native Android App (Kotlin + Jetpack Compose)',
+    item: '05. Secure Non-Executing Coding Lab & Sentinel Epistemic Audit',
     status: 'Implemented',
-    notes: 'Complete Android Studio / Gradle project in /android with private internal history deletion, TLS config, and Play Internal Testing guide.',
+    notes: 'Multi-file editor, static AST/regex security inspection, node:test synthesis, script-stripped sandboxed HTML/SVG preview (executedCode: false), and verified fact vs. inference audit.',
   },
   {
-    item: '06. Grounded Web Search & Document Passage Retrieval',
+    item: '06. Aurenyx TrustGrid Governance & Native Android Suite',
     status: 'Implemented',
-    notes: 'Server-side Gemini Google Search Grounding + passage-indexed citations; degrades honestly with explicit Research Status labels and zero fabricated URLs.',
+    notes: '15-question risk assessment, provisional risk rules, 8+ test scenarios, Passport export, plus full Kotlin + Jetpack Compose Android project in /android.',
   },
   {
-    item: '07. PDF & Text-File Processing',
-    status: 'Partial (Text Scope)',
-    notes: '.txt, .md, .csv, .json, and pasted PDF text active; scanned binary PDF OCR excluded on ₹0 tier.',
+    item: '07. Multimodal Workspace & Untrusted Input Isolation',
+    status: 'Partial (Text + Image Scope)',
+    notes: 'PNG/JPEG/WEBP/GIF images and .txt/.md/.csv/.json up to 1 MB wrapped in <untrusted_data> boundaries; binary PDF OCR excluded on ₹0 tier.',
   },
   {
-    item: '08. Studio Raster Image Generation & Cloud Database Sync',
-    status: '₹0 Guardrail / Local Fallback',
-    notes: 'Paid models blocked unless ENABLE_PAID_MODELS=true; SVG Frame Blueprint fallback + local JSON export active.',
+    item: '08. Studio Raster Image Generation & Cloud Firestore Sync',
+    status: '₹0 Guardrail / Verified Auth Sync',
+    notes: 'Paid models blocked unless ENABLE_PAID_MODELS=true; Firestore persistence active for verified accounts with local session fallback.',
   },
 ];
 

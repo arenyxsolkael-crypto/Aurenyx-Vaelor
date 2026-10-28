@@ -1,8 +1,12 @@
 import crypto from 'node:crypto';
 import type {
   Conversation,
+  CouncilSessionResult,
+  DeepResearchReport,
   DocumentChunk,
   KnowledgeDocument,
+  MemoryInjectionSettings,
+  MissionRun,
   ProjectSummaryNote,
   ProjectTaskPlanItem,
   ProjectWorkspace,
@@ -100,7 +104,11 @@ export class EphemeralSessionStore {
   public documents: KnowledgeDocument[] = [];
   public projects: ProjectWorkspace[] = [];
   public taskRuns: StructuredTaskRun[] = [];
+  public missions: MissionRun[] = [];
+  public deepResearchReports: DeepResearchReport[] = [];
+  public councilSessions: CouncilSessionResult[] = [];
 
+  private readonly memorySettingsByOwner = new Map<string, MemoryInjectionSettings>();
   private readonly seedStarterEnabled: boolean;
   private readonly seededOwners = new Set<string>();
   private readonly purgedOwners = new Set<string>();
@@ -507,25 +515,101 @@ export class EphemeralSessionStore {
   }
 
   /**
-   * Per-owner Memory isolation.
+   * Per-owner & Per-project Memory isolation + Memory Injection Toggle (VAELOR v0.4 Module B).
+   * Prevents cross-project memory leakage and honors global/per-project toggle settings.
    */
-  public listMemoriesForOwner(ownerSessionId: string): SavedMemory[] {
-    return this.memories.filter(
+  public getMemorySettingsForOwner(ownerSessionId: string): MemoryInjectionSettings {
+    const existing = this.memorySettingsByOwner.get(ownerSessionId);
+    if (existing) {
+      return {
+        ...existing,
+        disabledProjectIds: [...existing.disabledProjectIds],
+      };
+    }
+    const defaults: MemoryInjectionSettings = {
+      globalEnabled: true,
+      disabledProjectIds: [],
+      updatedAt: new Date().toISOString(),
+    };
+    this.memorySettingsByOwner.set(ownerSessionId, defaults);
+    return { ...defaults, disabledProjectIds: [] };
+  }
+
+  public updateMemorySettingsForOwner(
+    ownerSessionId: string,
+    patch: { globalEnabled?: boolean; disabledProjectIds?: string[] }
+  ): MemoryInjectionSettings {
+    const current = this.getMemorySettingsForOwner(ownerSessionId);
+    const next: MemoryInjectionSettings = {
+      globalEnabled:
+        patch.globalEnabled !== undefined ? patch.globalEnabled : current.globalEnabled,
+      disabledProjectIds:
+        patch.disabledProjectIds !== undefined
+          ? Array.from(new Set(patch.disabledProjectIds)).slice(0, 100)
+          : current.disabledProjectIds,
+      updatedAt: new Date().toISOString(),
+    };
+    this.memorySettingsByOwner.set(ownerSessionId, next);
+    return { ...next, disabledProjectIds: [...next.disabledProjectIds] };
+  }
+
+  public listMemoriesForOwner(ownerSessionId: string, filterProjectId?: string): SavedMemory[] {
+    const owned = this.memories.filter(
       (m) => (m.ownerSessionId || 'default-session') === ownerSessionId
     );
+    if (filterProjectId === undefined) {
+      return owned;
+    }
+    if (filterProjectId === '__global__') {
+      return owned.filter((m) => !m.projectId);
+    }
+    return owned.filter((m) => m.projectId === filterProjectId);
+  }
+
+  /**
+   * Returns memories eligible for model prompt injection for the given owner and active project:
+   * - Returns [] when global memory injection is disabled or disabled for activeProjectId.
+   * - When activeProjectId is set: returns memories scoped to activeProjectId + global user memories (!m.projectId),
+   *   strictly excluding memories belonging to any OTHER projectId.
+   * - When activeProjectId is unset: returns ONLY global memories (!m.projectId), never project-scoped memories.
+   */
+  public listMemoriesForContext(
+    ownerSessionId: string,
+    activeProjectId?: string
+  ): SavedMemory[] {
+    const settings = this.getMemorySettingsForOwner(ownerSessionId);
+    if (!settings.globalEnabled) {
+      return [];
+    }
+    if (activeProjectId && settings.disabledProjectIds.includes(activeProjectId)) {
+      return [];
+    }
+    const owned = this.listMemoriesForOwner(ownerSessionId);
+    if (activeProjectId) {
+      const projectMatches = owned.filter((m) => m.projectId === activeProjectId);
+      const globalMatches = owned.filter((m) => !m.projectId);
+      return [...projectMatches, ...globalMatches];
+    }
+    return owned.filter((m) => !m.projectId);
   }
 
   public addMemoryForOwner(
     ownerSessionId: string,
     input: Omit<SavedMemory, 'id' | 'createdAt' | 'ownerSessionId'>
   ): SavedMemory {
+    const nowIso = new Date().toISOString();
     const memory: SavedMemory = {
       id: `mem_${crypto.randomUUID().slice(0, 8)}`,
       label: input.label,
       content: input.content,
       category: input.category,
+      memoryType: input.memoryType ?? 'note',
+      projectId: input.projectId ? input.projectId.trim() : undefined,
+      referenceUrl: input.referenceUrl ? input.referenceUrl.trim() : undefined,
+      approvedByUser: input.approvedByUser ?? true,
       ownerSessionId,
-      createdAt: new Date().toISOString(),
+      createdAt: nowIso,
+      updatedAt: nowIso,
     };
     this.memories.unshift(memory);
     return memory;
@@ -533,6 +617,55 @@ export class EphemeralSessionStore {
 
   public addMemory(input: Omit<SavedMemory, 'id' | 'createdAt' | 'ownerSessionId'>): SavedMemory {
     return this.addMemoryForOwner('default-session', input);
+  }
+
+  public updateMemoryForOwner(
+    ownerSessionId: string,
+    id: string,
+    patch: Partial<
+      Pick<SavedMemory, 'label' | 'content' | 'category' | 'memoryType' | 'projectId' | 'referenceUrl'>
+    >
+  ): 'not_found' | 'forbidden' | SavedMemory {
+    const idx = this.memories.findIndex((m) => m.id === id);
+    if (idx < 0) return 'not_found';
+    const current = this.memories[idx];
+    if ((current.ownerSessionId || 'default-session') !== ownerSessionId) {
+      return 'forbidden';
+    }
+    const updated: SavedMemory = {
+      ...current,
+      label: patch.label !== undefined ? patch.label : current.label,
+      content: patch.content !== undefined ? patch.content : current.content,
+      category: patch.category !== undefined ? patch.category : current.category,
+      memoryType: patch.memoryType !== undefined ? patch.memoryType : current.memoryType,
+      projectId:
+        patch.projectId !== undefined
+          ? patch.projectId.trim() || undefined
+          : current.projectId,
+      referenceUrl:
+        patch.referenceUrl !== undefined
+          ? patch.referenceUrl.trim() || undefined
+          : current.referenceUrl,
+      updatedAt: new Date().toISOString(),
+    };
+    this.memories[idx] = updated;
+    return updated;
+  }
+
+  public exportMemoriesForOwner(ownerSessionId: string, projectId?: string) {
+    const scoped =
+      projectId && projectId !== '__all__'
+        ? this.listMemoriesForOwner(ownerSessionId, projectId)
+        : this.listMemoriesForOwner(ownerSessionId);
+
+    return {
+      schemaVersion: 'vaelor-memory-export-v0.4' as const,
+      exportedAt: new Date().toISOString(),
+      projectId: projectId && projectId !== '__all__' ? projectId : null,
+      count: scoped.length,
+      memorySettings: this.getMemorySettingsForOwner(ownerSessionId),
+      memories: scoped.map(({ ownerSessionId: _o, ...safe }) => safe),
+    };
   }
 
   public deleteMemoryForOwner(
@@ -649,8 +782,108 @@ export class EphemeralSessionStore {
     }
   }
 
+  /**
+   * Per-owner Mission Control, Deep Research, and Vanguard Council isolation (VAELOR v0.4).
+   */
+  public listMissionsForOwner(ownerSessionId: string, projectId?: string): MissionRun[] {
+    const owned = this.missions.filter(
+      (m) => (m.ownerSessionId || 'default-session') === ownerSessionId
+    );
+    if (projectId) {
+      return owned.filter((m) => m.projectId === projectId);
+    }
+    return owned.slice(0, 50);
+  }
+
+  public getMissionForOwner(
+    ownerSessionId: string,
+    missionId: string
+  ): 'not_found' | 'forbidden' | MissionRun {
+    const found = this.missions.find((m) => m.id === missionId);
+    if (!found) return 'not_found';
+    if ((found.ownerSessionId || 'default-session') !== ownerSessionId) {
+      return 'forbidden';
+    }
+    return found;
+  }
+
+  public upsertMissionForOwner(ownerSessionId: string, mission: MissionRun): 'forbidden' | MissionRun {
+    const idx = this.missions.findIndex((m) => m.id === mission.id);
+    if (idx >= 0) {
+      const existing = this.missions[idx];
+      if ((existing.ownerSessionId || 'default-session') !== ownerSessionId) {
+        return 'forbidden';
+      }
+      const next: MissionRun = {
+        ...mission,
+        ownerSessionId,
+        updatedAt: new Date().toISOString(),
+      };
+      this.missions[idx] = next;
+      return next;
+    }
+    const created: MissionRun = {
+      ...mission,
+      ownerSessionId,
+    };
+    this.missions.unshift(created);
+    if (this.missions.length > 200) {
+      this.missions = this.missions.slice(0, 200);
+    }
+    return created;
+  }
+
+  public deleteMissionForOwner(
+    ownerSessionId: string,
+    missionId: string
+  ): 'not_found' | 'forbidden' | 'deleted' {
+    const existing = this.missions.find((m) => m.id === missionId);
+    if (!existing) return 'not_found';
+    if ((existing.ownerSessionId || 'default-session') !== ownerSessionId) {
+      return 'forbidden';
+    }
+    this.missions = this.missions.filter((m) => m.id !== missionId);
+    return 'deleted';
+  }
+
+  public listDeepResearchForOwner(ownerSessionId: string): DeepResearchReport[] {
+    return this.deepResearchReports
+      .filter((r) => (r.ownerSessionId || 'default-session') === ownerSessionId)
+      .slice(0, 30);
+  }
+
+  public addDeepResearchForOwner(
+    ownerSessionId: string,
+    report: DeepResearchReport
+  ): DeepResearchReport {
+    const stored: DeepResearchReport = { ...report, ownerSessionId };
+    this.deepResearchReports.unshift(stored);
+    if (this.deepResearchReports.length > 100) {
+      this.deepResearchReports = this.deepResearchReports.slice(0, 100);
+    }
+    return stored;
+  }
+
+  public listCouncilSessionsForOwner(ownerSessionId: string): CouncilSessionResult[] {
+    return this.councilSessions
+      .filter((c) => (c.ownerSessionId || 'default-session') === ownerSessionId)
+      .slice(0, 30);
+  }
+
+  public addCouncilSessionForOwner(
+    ownerSessionId: string,
+    session: CouncilSessionResult
+  ): CouncilSessionResult {
+    const stored: CouncilSessionResult = { ...session, ownerSessionId };
+    this.councilSessions.unshift(stored);
+    if (this.councilSessions.length > 100) {
+      this.councilSessions = this.councilSessions.slice(0, 100);
+    }
+    return stored;
+  }
+
   public clearScope(
-    scope: 'conversations' | 'memories' | 'documents' | 'tasks' | 'all',
+    scope: 'conversations' | 'memories' | 'documents' | 'tasks' | 'missions' | 'all',
     ownerSessionId?: string
   ): void {
     if (scope === 'conversations' || scope === 'all') {
@@ -689,21 +922,40 @@ export class EphemeralSessionStore {
         this.taskRuns = [];
       }
     }
+    if (scope === 'missions' || scope === 'all') {
+      if (ownerSessionId) {
+        this.missions = this.missions.filter(
+          (m) => (m.ownerSessionId || 'default-session') !== ownerSessionId
+        );
+      } else {
+        this.missions = [];
+      }
+    }
     if (scope === 'all') {
       if (ownerSessionId) {
         this.purgedOwners.add(ownerSessionId);
+        this.memorySettingsByOwner.delete(ownerSessionId);
         this.projects = this.projects.filter(
           (p) => (p.ownerSessionId || 'default-session') !== ownerSessionId
         );
+        this.deepResearchReports = this.deepResearchReports.filter(
+          (r) => (r.ownerSessionId || 'default-session') !== ownerSessionId
+        );
+        this.councilSessions = this.councilSessions.filter(
+          (c) => (c.ownerSessionId || 'default-session') !== ownerSessionId
+        );
       } else {
+        this.memorySettingsByOwner.clear();
         this.projects = [];
+        this.deepResearchReports = [];
+        this.councilSessions = [];
       }
     }
   }
 
   /**
    * Permanently deletes 100% of server-side data belonging to an authenticated account (`uid:<uid>`)
-   * without touching any other user's projects, chats, documents, memories, or tasks.
+   * without touching any other user's projects, chats, documents, memories, missions, or tasks.
    */
   public purgeAllDataForOwner(ownerSessionId: string): void {
     this.clearScope('all', ownerSessionId);

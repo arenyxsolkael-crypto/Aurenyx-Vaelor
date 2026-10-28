@@ -19,15 +19,29 @@ import {
   type ModelGateway,
 } from './src/server/modelGateway.ts';
 import { MAX_ORCHESTRATOR_MODEL_STEPS, VaelorOrchestrator } from './src/server/orchestrator.ts';
+import { MissionControlService } from './src/server/missionService.ts';
+import {
+  CodingLabService,
+  DeepResearchService,
+  VanguardCouncilService,
+} from './src/server/v04WorkspaceServices.ts';
 import { EphemeralSessionStore } from './src/server/store.ts';
 import { executeToolWithPermissions, TOOL_REGISTRY } from './src/server/tools.ts';
 import {
   ChatRequestSchema,
+  CodingLabRequestSchema,
   ConversationPatchSchema,
   ConversationSyncSchema,
+  CouncilRequestSchema,
+  DeepResearchRequestSchema,
   detectSecretInText,
   DocumentIngestSchema,
   MemoryCreateSchema,
+  MemorySettingsSchema,
+  MemoryUpdateSchema,
+  MissionControlSchema,
+  MissionExecuteSchema,
+  MissionPlanSchema,
   ProjectCreateSchema,
   ProjectUpdateSchema,
   SlidingWindowRateLimiter,
@@ -49,8 +63,11 @@ import {
   type AuthConfigResponse,
   type AuthenticatedAccountSummary,
   type Conversation,
+  type CouncilSessionResult,
+  type DeepResearchReport,
   type HealthResponse,
   type KnowledgeDocument,
+  type MissionRun,
   type ProjectWorkspace,
   type SavedMemory,
   type StructuredTaskRun,
@@ -87,6 +104,10 @@ export function createApiApp(deps: AppServerDependencies = {}) {
   const gateway = deps.gateway ?? new GeminiModelGateway(process.env);
   const store = deps.store ?? new EphemeralSessionStore(true);
   const orchestrator = new VaelorOrchestrator(gateway);
+  const missionService = new MissionControlService(gateway);
+  const deepResearchService = new DeepResearchService(gateway);
+  const councilService = new VanguardCouncilService(gateway);
+  const codingLabService = new CodingLabService(gateway);
   const requireAuth = deps.requireAuth ?? false;
   const firebasePublicConfig = deps.firebaseConfigOverride ?? loadServerFirebaseConfig();
   const tokenVerifier =
@@ -194,6 +215,21 @@ export function createApiApp(deps: AppServerDependencies = {}) {
     return safeMem;
   };
 
+  const sanitizeMissionForClient = (mission: MissionRun): MissionRun => {
+    const { ownerSessionId: _omit, ...safeMission } = mission;
+    return safeMission;
+  };
+
+  const sanitizeDeepResearchForClient = (report: DeepResearchReport): DeepResearchReport => {
+    const { ownerSessionId: _omit, ...safeReport } = report;
+    return safeReport;
+  };
+
+  const sanitizeCouncilForClient = (session: CouncilSessionResult): CouncilSessionResult => {
+    const { ownerSessionId: _omit, ...safeSession } = session;
+    return safeSession;
+  };
+
   const effectiveStorageMode: HealthResponse['storageMode'] =
     requireAuth && firebasePublicConfig.configured
       ? 'firestore-plus-session'
@@ -280,6 +316,7 @@ export function createApiApp(deps: AppServerDependencies = {}) {
       documents: 0,
       projects: 0,
       tasks: 0,
+      missions: 0,
     };
 
     if (optionalUser) {
@@ -290,6 +327,7 @@ export function createApiApp(deps: AppServerDependencies = {}) {
         documents: store.listDocumentsForOwner(uidOwner).length,
         projects: store.listProjectsForOwner(uidOwner).length,
         tasks: store.listTasksForOwner(uidOwner).length,
+        missions: store.listMissionsForOwner(uidOwner).length,
       };
     } else if (!requireAuth) {
       const ownerSessionId = getOwnerSessionId(req);
@@ -299,8 +337,14 @@ export function createApiApp(deps: AppServerDependencies = {}) {
         documents: store.listDocumentsForOwner('default-session').length,
         projects: store.listProjectsForOwner('default-session').length,
         tasks: store.listTasksForOwner(ownerSessionId).length,
+        missions: store.listMissionsForOwner(ownerSessionId).length,
       };
     }
+
+    const routerStatus =
+      typeof gateway.getRouterStatus === 'function'
+        ? gateway.getRouterStatus(Boolean(status.mockModeDefault))
+        : undefined;
 
     const payload: HealthResponse = {
       ok: true,
@@ -313,6 +357,7 @@ export function createApiApp(deps: AppServerDependencies = {}) {
       liveSearchConfigured: Boolean(status.liveSearchConfigured),
       groundedSearchMode: status.groundedSearchMode,
       mockModeDefault: Boolean(status.mockModeDefault),
+      routerOperatingMode: routerStatus?.operatingMode,
       maxStepsPerRequest: MAX_ORCHESTRATOR_MODEL_STEPS,
       maxConcurrentRequests,
       rateLimitPerMinute: rateLimitMax,
@@ -434,6 +479,47 @@ export function createApiApp(deps: AppServerDependencies = {}) {
     });
   });
 
+  // 1c. Centralized Adaptive Model Router Status (Public read — zero secrets exposed)
+  app.get('/api/router/status', (req: Request, res: Response) => {
+    const mockMode = req.query.mockMode === 'true';
+    if (typeof gateway.getRouterStatus === 'function') {
+      res.json({
+        ok: true,
+        router: gateway.getRouterStatus(mockMode),
+      });
+      return;
+    }
+    const st = gateway.getStatus();
+    res.json({
+      ok: true,
+      router: {
+        provider: st.provider,
+        configured: st.configured,
+        operatingMode: mockMode
+          ? 'mock'
+          : !st.configured
+            ? 'unconfigured'
+            : st.primaryModel === st.fastModel
+              ? 'single-model'
+              : 'multi-model',
+        primaryModel: st.primaryModel,
+        fastModel: st.fastModel,
+        reasoningModel: st.primaryModel,
+        distinctModelsConfigured: st.primaryModel !== st.fastModel,
+        paidModelsEnabled: st.paidModelsEnabled,
+        liveSearchAvailable: Boolean(st.liveSearchConfigured),
+        maxContextTurns: 8,
+        maxContextChars: 48_000,
+        defaultTimeoutMs: 22_000,
+        maxRetries: 2,
+        disclosureNote:
+          st.primaryModel === st.fastModel
+            ? `Single-model mode active (${st.primaryModel}).`
+            : `Multi-model routing active (${st.primaryModel} / ${st.fastModel}).`,
+      },
+    });
+  });
+
   // 2. Agents & Tools metadata (Public metadata; scopes run stats to verified caller if signed in)
   app.get('/api/agents', async (req: Request, res: Response) => {
     const optionalUser = await tryResolveOptionalAuth(req);
@@ -505,6 +591,7 @@ export function createApiApp(deps: AppServerDependencies = {}) {
         documents: store.listDocumentsForOwner(uidKey).length,
         memories: store.listMemoriesForOwner(uidKey).length,
         tasks: store.listTasksForOwner(uidKey).length,
+        missions: store.listMissionsForOwner(uidKey).length,
       },
     };
     res.json({ ok: true, account: summary });
@@ -620,7 +707,7 @@ export function createApiApp(deps: AppServerDependencies = {}) {
         attachments,
         project,
         documents: store.listDocumentsForOwner(identity.resourceOwnerId),
-        memories: store.listMemoriesForOwner(identity.resourceOwnerId),
+        memories: store.listMemoriesForContext(identity.resourceOwnerId, project?.id),
         conversationId,
       });
 
@@ -756,7 +843,7 @@ export function createApiApp(deps: AppServerDependencies = {}) {
         attachments,
         project,
         documents: store.listDocumentsForOwner(identity.resourceOwnerId),
-        memories: store.listMemoriesForOwner(identity.resourceOwnerId),
+        memories: store.listMemoriesForContext(identity.resourceOwnerId, project?.id),
         conversationId,
         onStreamEvent: writeEvent,
       });
@@ -1051,15 +1138,89 @@ export function createApiApp(deps: AppServerDependencies = {}) {
     const identity = await resolveProtectedIdentity(req, res);
     if (!identity) return;
 
+    const filterProjectId =
+      typeof req.query.projectId === 'string' && req.query.projectId.trim()
+        ? req.query.projectId.trim()
+        : undefined;
+
+    if (filterProjectId && filterProjectId !== '__global__') {
+      const projCheck = store.getProjectForOwner(identity.resourceOwnerId, filterProjectId);
+      if (projCheck === 'forbidden') {
+        res.status(403).json({
+          error: 'Forbidden: You cannot inspect another user’s project memories.',
+          code: 'FORBIDDEN_RESOURCE_ACCESS',
+        });
+        return;
+      }
+    }
+
     res.json({
       storageMode: effectiveStorageMode,
+      memorySettings: store.getMemorySettingsForOwner(identity.resourceOwnerId),
       documents: store
         .listDocumentsForOwner(identity.resourceOwnerId)
         .map(sanitizeDocumentForClient),
       memories: store
-        .listMemoriesForOwner(identity.resourceOwnerId)
+        .listMemoriesForOwner(identity.resourceOwnerId, filterProjectId)
         .map(sanitizeMemoryForClient),
     });
+  });
+
+  app.get('/api/knowledge/memory-settings', async (req: Request, res: Response) => {
+    const identity = await resolveProtectedIdentity(req, res);
+    if (!identity) return;
+
+    res.json({
+      ok: true,
+      memorySettings: store.getMemorySettingsForOwner(identity.resourceOwnerId),
+    });
+  });
+
+  app.put('/api/knowledge/memory-settings', async (req: Request, res: Response) => {
+    const identity = await resolveProtectedIdentity(req, res);
+    if (!identity) return;
+
+    const parsed = MemorySettingsSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({
+        error: parsed.error.issues[0]?.message || 'Invalid memory settings payload.',
+        code: 'VALIDATION_ERROR',
+      });
+      return;
+    }
+
+    const memorySettings = store.updateMemorySettingsForOwner(
+      identity.resourceOwnerId,
+      parsed.data
+    );
+    res.json({ ok: true, memorySettings });
+  });
+
+  app.get('/api/knowledge/memories/export', async (req: Request, res: Response) => {
+    const identity = await resolveProtectedIdentity(req, res);
+    if (!identity) return;
+
+    const projectId =
+      typeof req.query.projectId === 'string' && req.query.projectId.trim()
+        ? req.query.projectId.trim()
+        : undefined;
+
+    if (projectId && projectId !== '__global__' && projectId !== '__all__') {
+      const projCheck = store.getProjectForOwner(identity.resourceOwnerId, projectId);
+      if (projCheck === 'not_found') {
+        res.status(404).json({ error: 'Project not found.', code: 'NOT_FOUND' });
+        return;
+      }
+      if (projCheck === 'forbidden') {
+        res.status(403).json({
+          error: 'Forbidden: Cannot export memories from another user’s project.',
+          code: 'FORBIDDEN_RESOURCE_ACCESS',
+        });
+        return;
+      }
+    }
+
+    res.json(store.exportMemoriesForOwner(identity.resourceOwnerId, projectId));
   });
 
   app.post('/api/knowledge/documents', async (req: Request, res: Response) => {
@@ -1113,11 +1274,74 @@ export function createApiApp(deps: AppServerDependencies = {}) {
     if (detectSecretInText(parsed.data.content) || detectSecretInText(parsed.data.label)) {
       res.status(400).json({
         error: 'Security guardrail: Never store API keys, tokens, or secrets in saved user memory.',
+        code: 'SECRET_DETECTED_IN_INPUT',
       });
       return;
     }
+    if (parsed.data.projectId) {
+      const projCheck = store.getProjectForOwner(identity.resourceOwnerId, parsed.data.projectId);
+      if (projCheck === 'forbidden') {
+        res.status(403).json({
+          error: 'Forbidden: Cannot attach memory to another user’s project.',
+          code: 'FORBIDDEN_RESOURCE_ACCESS',
+        });
+        return;
+      }
+    }
     const memory = store.addMemoryForOwner(identity.resourceOwnerId, parsed.data);
     res.status(201).json({ memory: sanitizeMemoryForClient(memory) });
+  });
+
+  app.patch('/api/knowledge/memories/:id', async (req: Request, res: Response) => {
+    const identity = await resolveProtectedIdentity(req, res);
+    if (!identity) return;
+
+    const parsed = MemoryUpdateSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: parsed.error.issues[0]?.message || 'Invalid memory update.',
+        code: 'VALIDATION_ERROR',
+      });
+      return;
+    }
+    if (
+      (parsed.data.content && detectSecretInText(parsed.data.content)) ||
+      (parsed.data.label && detectSecretInText(parsed.data.label))
+    ) {
+      res.status(400).json({
+        error: 'Security guardrail: Never store API keys, tokens, or secrets in saved user memory.',
+        code: 'SECRET_DETECTED_IN_INPUT',
+      });
+      return;
+    }
+    if (parsed.data.projectId) {
+      const projCheck = store.getProjectForOwner(identity.resourceOwnerId, parsed.data.projectId);
+      if (projCheck === 'forbidden') {
+        res.status(403).json({
+          error: 'Forbidden: Cannot move memory to another user’s project.',
+          code: 'FORBIDDEN_RESOURCE_ACCESS',
+        });
+        return;
+      }
+    }
+
+    const updated = store.updateMemoryForOwner(
+      identity.resourceOwnerId,
+      String(req.params.id),
+      parsed.data
+    );
+    if (updated === 'not_found') {
+      res.status(404).json({ error: 'Memory note not found.', code: 'NOT_FOUND' });
+      return;
+    }
+    if (updated === 'forbidden') {
+      res.status(403).json({
+        error: 'Forbidden: You cannot edit another user’s saved memory.',
+        code: 'FORBIDDEN_RESOURCE_ACCESS',
+      });
+      return;
+    }
+    res.json({ memory: sanitizeMemoryForClient(updated) });
   });
 
   app.delete('/api/knowledge/memories/:id', async (req: Request, res: Response) => {
@@ -1248,7 +1472,7 @@ export function createApiApp(deps: AppServerDependencies = {}) {
         requestedTools: existing.taskPlan?.selectedTools,
         project,
         documents: store.listDocumentsForOwner(identity.resourceOwnerId),
-        memories: store.listMemoriesForOwner(identity.resourceOwnerId),
+        memories: store.listMemoriesForContext(identity.resourceOwnerId, project?.id),
       });
 
       const mergedRun: StructuredTaskRun = {
@@ -1446,13 +1670,347 @@ export function createApiApp(deps: AppServerDependencies = {}) {
     res.json({ ok: true });
   });
 
+  // 7c. Protected v0.4 Mission Control Endpoints (Plan, Execute, Pause/Resume/Cancel/Retry/Approve)
+  app.get('/api/missions', async (req: Request, res: Response) => {
+    const identity = await resolveProtectedIdentity(req, res);
+    if (!identity) return;
+
+    const projectId =
+      typeof req.query.projectId === 'string' && req.query.projectId.trim()
+        ? req.query.projectId.trim()
+        : undefined;
+
+    if (projectId) {
+      const projCheck = store.getProjectForOwner(identity.resourceOwnerId, projectId);
+      if (projCheck === 'forbidden') {
+        res.status(403).json({
+          error: 'Forbidden: Cannot list missions for another user’s project.',
+          code: 'FORBIDDEN_RESOURCE_ACCESS',
+        });
+        return;
+      }
+    }
+
+    res.json({
+      storageMode: effectiveStorageMode,
+      missions: store
+        .listMissionsForOwner(identity.sessionOwnerId, projectId)
+        .map(sanitizeMissionForClient),
+    });
+  });
+
+  app.post('/api/missions/plan', async (req: Request, res: Response) => {
+    const identity = await resolveProtectedIdentity(req, res);
+    if (!identity) return;
+
+    const parsed = MissionPlanSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: parsed.error.issues[0]?.message || 'Invalid mission plan payload.',
+        code: 'VALIDATION_ERROR',
+      });
+      return;
+    }
+    if (detectSecretInText(parsed.data.title) || detectSecretInText(parsed.data.objective)) {
+      res.status(400).json({
+        error: 'Security guardrail: Never submit API keys or secrets into Mission Control.',
+        code: 'SECRET_DETECTED_IN_INPUT',
+      });
+      return;
+    }
+    if (parsed.data.projectId) {
+      const projCheck = store.getProjectForOwner(identity.resourceOwnerId, parsed.data.projectId);
+      if (projCheck === 'forbidden') {
+        res.status(403).json({
+          error: 'Forbidden: Cannot scope mission to another user’s project.',
+          code: 'FORBIDDEN_RESOURCE_ACCESS',
+        });
+        return;
+      }
+    }
+
+    const planned = missionService.createMissionPlan({
+      title: parsed.data.title,
+      objective: parsed.data.objective,
+      projectId: parsed.data.projectId,
+      preferredAgent: parsed.data.preferredAgent,
+      requestedTools: parsed.data.requestedTools,
+      requireHumanApproval: parsed.data.requireHumanApproval,
+      mockMode: parsed.data.mockMode,
+      maxSteps: parsed.data.maxSteps,
+      maxRetries: parsed.data.maxRetries,
+      maxElapsedMs: parsed.data.maxElapsedMs,
+      maxModelCalls: parsed.data.maxModelCalls,
+      ownerSessionId: identity.sessionOwnerId,
+    });
+    store.upsertMissionForOwner(identity.sessionOwnerId, planned);
+    res.status(201).json({ ok: true, mission: sanitizeMissionForClient(planned) });
+  });
+
+  app.post('/api/missions/:id/execute', async (req: Request, res: Response) => {
+    const identity = await resolveProtectedIdentity(req, res);
+    if (!identity) return;
+
+    const parsed = MissionExecuteSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({
+        error: parsed.error.issues[0]?.message || 'Invalid mission execute options.',
+        code: 'VALIDATION_ERROR',
+      });
+      return;
+    }
+
+    const existing = store.getMissionForOwner(identity.sessionOwnerId, String(req.params.id));
+    if (existing === 'not_found') {
+      res.status(404).json({ error: 'Mission not found.', code: 'NOT_FOUND' });
+      return;
+    }
+    if (existing === 'forbidden') {
+      res.status(403).json({
+        error: 'Forbidden: Mission belongs to another private account or session.',
+        code: 'FORBIDDEN_RESOURCE_ACCESS',
+      });
+      return;
+    }
+
+    let project: ProjectWorkspace | undefined;
+    if (existing.projectId) {
+      const projCheck = store.getProjectForOwner(identity.resourceOwnerId, existing.projectId);
+      if (projCheck !== 'not_found' && projCheck !== 'forbidden') {
+        project = projCheck;
+      }
+    }
+
+    const updated = await missionService.executeReadyTasks(existing, {
+      documents: store.listDocumentsForOwner(identity.resourceOwnerId),
+      memories: store.listMemoriesForContext(identity.resourceOwnerId, existing.projectId),
+      project,
+      mockMode: parsed.data.mockMode ?? existing.mockMode,
+    });
+    store.upsertMissionForOwner(identity.sessionOwnerId, updated);
+    res.json({ ok: true, mission: sanitizeMissionForClient(updated) });
+  });
+
+  app.post('/api/missions/:id/control', async (req: Request, res: Response) => {
+    const identity = await resolveProtectedIdentity(req, res);
+    if (!identity) return;
+
+    const parsed = MissionControlSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: parsed.error.issues[0]?.message || 'Invalid mission control command.',
+        code: 'VALIDATION_ERROR',
+      });
+      return;
+    }
+
+    const existing = store.getMissionForOwner(identity.sessionOwnerId, String(req.params.id));
+    if (existing === 'not_found') {
+      res.status(404).json({ error: 'Mission not found.', code: 'NOT_FOUND' });
+      return;
+    }
+    if (existing === 'forbidden') {
+      res.status(403).json({
+        error: 'Forbidden: Mission belongs to another private account or session.',
+        code: 'FORBIDDEN_RESOURCE_ACCESS',
+      });
+      return;
+    }
+
+    const updated = missionService.applyControlAction(existing, parsed.data);
+    store.upsertMissionForOwner(identity.sessionOwnerId, updated);
+    res.json({ ok: true, mission: sanitizeMissionForClient(updated) });
+  });
+
+  app.delete('/api/missions/:id', async (req: Request, res: Response) => {
+    const identity = await resolveProtectedIdentity(req, res);
+    if (!identity) return;
+
+    const removed = store.deleteMissionForOwner(identity.sessionOwnerId, String(req.params.id));
+    if (removed === 'not_found') {
+      res.status(404).json({ error: 'Mission not found.', code: 'NOT_FOUND' });
+      return;
+    }
+    if (removed === 'forbidden') {
+      res.status(403).json({
+        error: 'Forbidden: Cannot delete another user’s mission.',
+        code: 'FORBIDDEN_RESOURCE_ACCESS',
+      });
+      return;
+    }
+    res.json({ ok: true });
+  });
+
+  // 7d. Protected v0.4 Deep Research Studio Endpoints
+  app.get('/api/research/reports', async (req: Request, res: Response) => {
+    const identity = await resolveProtectedIdentity(req, res);
+    if (!identity) return;
+
+    res.json({
+      ok: true,
+      reports: store
+        .listDeepResearchForOwner(identity.sessionOwnerId)
+        .map(sanitizeDeepResearchForClient),
+    });
+  });
+
+  app.post('/api/research/deep', async (req: Request, res: Response) => {
+    const identity = await resolveProtectedIdentity(req, res);
+    if (!identity) return;
+
+    const parsed = DeepResearchRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: parsed.error.issues[0]?.message || 'Invalid Deep Research query.',
+        code: 'VALIDATION_ERROR',
+      });
+      return;
+    }
+    if (detectSecretInText(parsed.data.query)) {
+      res.status(400).json({
+        error: 'Security guardrail: Never submit API keys or private credentials into Deep Research.',
+        code: 'SECRET_DETECTED_IN_INPUT',
+      });
+      return;
+    }
+
+    let project: ProjectWorkspace | undefined;
+    if (parsed.data.projectId) {
+      const projCheck = store.getProjectForOwner(identity.resourceOwnerId, parsed.data.projectId);
+      if (projCheck === 'forbidden') {
+        res.status(403).json({
+          error: 'Forbidden: Cannot run research against another user’s project.',
+          code: 'FORBIDDEN_RESOURCE_ACCESS',
+        });
+        return;
+      }
+      if (projCheck !== 'not_found') {
+        project = projCheck;
+      }
+    }
+
+    const report = await deepResearchService.runDeepResearch({
+      query: parsed.data.query,
+      projectId: parsed.data.projectId,
+      project,
+      documents: store.listDocumentsForOwner(identity.resourceOwnerId),
+      memories: store.listMemoriesForContext(identity.resourceOwnerId, parsed.data.projectId),
+      mockMode: parsed.data.mockMode,
+      ownerSessionId: identity.sessionOwnerId,
+    });
+    store.addDeepResearchForOwner(identity.sessionOwnerId, report);
+    res.json({ ok: true, report: sanitizeDeepResearchForClient(report) });
+  });
+
+  // 7e. Protected v0.4 Aether Vanguard Council Endpoints
+  app.get('/api/council/sessions', async (req: Request, res: Response) => {
+    const identity = await resolveProtectedIdentity(req, res);
+    if (!identity) return;
+
+    res.json({
+      ok: true,
+      sessions: store
+        .listCouncilSessionsForOwner(identity.sessionOwnerId)
+        .map(sanitizeCouncilForClient),
+    });
+  });
+
+  app.post('/api/council/convene', async (req: Request, res: Response) => {
+    const identity = await resolveProtectedIdentity(req, res);
+    if (!identity) return;
+
+    const parsed = CouncilRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: parsed.error.issues[0]?.message || 'Invalid Vanguard Council request.',
+        code: 'VALIDATION_ERROR',
+      });
+      return;
+    }
+    if (detectSecretInText(parsed.data.prompt)) {
+      res.status(400).json({
+        error: 'Security guardrail: Never submit API keys or secrets into Council deliberation.',
+        code: 'SECRET_DETECTED_IN_INPUT',
+      });
+      return;
+    }
+
+    let project: ProjectWorkspace | undefined;
+    if (parsed.data.projectId) {
+      const projCheck = store.getProjectForOwner(identity.resourceOwnerId, parsed.data.projectId);
+      if (projCheck === 'forbidden') {
+        res.status(403).json({
+          error: 'Forbidden: Cannot convene Council on another user’s project.',
+          code: 'FORBIDDEN_RESOURCE_ACCESS',
+        });
+        return;
+      }
+      if (projCheck !== 'not_found') {
+        project = projCheck;
+      }
+    }
+
+    const sessionResult = await councilService.conveneCouncil({
+      prompt: parsed.data.prompt,
+      projectId: parsed.data.projectId,
+      project,
+      documents: store.listDocumentsForOwner(identity.resourceOwnerId),
+      memories: store.listMemoriesForContext(identity.resourceOwnerId, parsed.data.projectId),
+      selectedRoles: parsed.data.selectedRoles,
+      maxCallBudget: parsed.data.maxCallBudget,
+      maxCharsPerRole: parsed.data.maxCharsPerRole,
+      mockMode: parsed.data.mockMode,
+      ownerSessionId: identity.sessionOwnerId,
+    });
+    store.addCouncilSessionForOwner(identity.sessionOwnerId, sessionResult);
+    res.json({ ok: true, session: sanitizeCouncilForClient(sessionResult) });
+  });
+
+  // 7f. Protected v0.4 Secure Coding Lab Endpoint (Static Analysis, Code Gen & Test Plans — ZERO Execution)
+  app.post('/api/coding-lab/assist', async (req: Request, res: Response) => {
+    const identity = await resolveProtectedIdentity(req, res);
+    if (!identity) return;
+
+    const parsed = CodingLabRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: parsed.error.issues[0]?.message || 'Invalid Coding Lab request.',
+        code: 'VALIDATION_ERROR',
+      });
+      return;
+    }
+    if (detectSecretInText(parsed.data.prompt)) {
+      res.status(400).json({
+        error: 'Security guardrail: Never submit real API keys or secrets in Coding Lab prompts.',
+        code: 'SECRET_DETECTED_IN_INPUT',
+      });
+      return;
+    }
+
+    const result = await codingLabService.runAssist({
+      mode: parsed.data.mode,
+      prompt: parsed.data.prompt,
+      files: parsed.data.files,
+      mockMode: parsed.data.mockMode,
+      ownerSessionId: identity.sessionOwnerId,
+    });
+    res.json({ ok: true, result });
+  });
+
   // 8. Privacy & Scoped Account Data Purge Controls
   app.post('/api/session/purge', async (req: Request, res: Response) => {
     const identity = await resolveProtectedIdentity(req, res);
     if (!identity) return;
 
     const scopeRaw = req.body?.scope;
-    const validScopes = new Set(['conversations', 'memories', 'documents', 'tasks', 'all']);
+    const validScopes = new Set([
+      'conversations',
+      'memories',
+      'documents',
+      'tasks',
+      'missions',
+      'all',
+    ]);
     const scope = validScopes.has(scopeRaw) ? scopeRaw : 'all';
 
     if (identity.verifiedUser) {
@@ -1461,7 +2019,7 @@ export function createApiApp(deps: AppServerDependencies = {}) {
       const legacyOwner = req.header('x-vaelor-session-token')
         ? identity.sessionOwnerId
         : undefined;
-      if (scope === 'conversations' || scope === 'tasks') {
+      if (scope === 'conversations' || scope === 'tasks' || scope === 'missions') {
         store.clearScope(scope, legacyOwner);
       } else {
         store.clearScope(scope, undefined);
@@ -1566,7 +2124,7 @@ async function startServer() {
   }
 
   httpServer.listen(port, '0.0.0.0', () => {
-    console.log(`Aurenyx Vaelor 0.3 server listening on http://0.0.0.0:${port}`);
+    console.log(`Aurenyx Vaelor 0.4 server listening on http://0.0.0.0:${port}`);
   });
 }
 

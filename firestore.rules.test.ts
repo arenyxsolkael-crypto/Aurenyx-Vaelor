@@ -7,7 +7,7 @@ import path from 'node:path';
  * Deterministic Firestore Security Rules Evaluator & Structural Verifier
  * Mirrors the exact predicates in `/firestore.rules` and `/firebase-blueprint.json`
  * to test all 12 "Dirty Dozen" adversarial payloads (from `security_spec.md`)
- * plus positive verified-owner paths in fast offline `node:test` execution.
+ * plus positive verified-owner paths across all 5 collections in fast offline `node:test`.
  */
 
 interface MockAuthContext {
@@ -98,6 +98,18 @@ function hasValidParentUser(state: MockFirestoreState, auth: MockAuthContext | n
   return Boolean(parent && parent.ownerId === auth.uid);
 }
 
+function hasValidOptionalProjectRef(
+  state: MockFirestoreState,
+  auth: MockAuthContext | null,
+  userId: string,
+  projectId: unknown
+): boolean {
+  if (!isSignedIn(auth) || typeof projectId !== 'string') return false;
+  if (projectId === '') return true;
+  const projectDoc = state.docs.get(`/users/${userId}/projects/${projectId}`);
+  return Boolean(projectDoc && projectDoc.ownerId === auth.uid);
+}
+
 function isValidUserProfile(auth: MockAuthContext | null, data: Record<string, unknown>): boolean {
   return (
     isSignedIn(auth) &&
@@ -184,6 +196,62 @@ function isValidCloudMemory(auth: MockAuthContext | null, data: Record<string, u
     typeof data.category === 'string' &&
     data.category.length <= 24 &&
     ['preference', 'project-fact', 'constraint', 'note'].includes(data.category) &&
+    typeof data.memoryType === 'string' &&
+    data.memoryType.length <= 16 &&
+    ['note', 'decision', 'goal', 'summary', 'reference'].includes(data.memoryType) &&
+    typeof data.projectId === 'string' &&
+    data.projectId.length <= 128 &&
+    /^$|^[a-zA-Z0-9_-]+$/.test(data.projectId) &&
+    typeof data.referenceUrl === 'string' &&
+    data.referenceUrl.length <= 500 &&
+    isTimestamp(data.createdAt) &&
+    isTimestamp(data.updatedAt)
+  );
+}
+
+function isValidCloudMission(auth: MockAuthContext | null, data: Record<string, unknown>): boolean {
+  return (
+    isSignedIn(auth) &&
+    typeof data.ownerId === 'string' &&
+    data.ownerId.length >= 1 &&
+    data.ownerId.length <= 128 &&
+    /^[a-zA-Z0-9_-]+$/.test(data.ownerId) &&
+    data.ownerId === auth.uid &&
+    typeof data.title === 'string' &&
+    data.title.length >= 2 &&
+    data.title.length <= 120 &&
+    typeof data.objective === 'string' &&
+    data.objective.length >= 4 &&
+    data.objective.length <= 2000 &&
+    typeof data.projectId === 'string' &&
+    data.projectId.length <= 128 &&
+    /^$|^[a-zA-Z0-9_-]+$/.test(data.projectId) &&
+    typeof data.status === 'string' &&
+    data.status.length <= 24 &&
+    [
+      'planned',
+      'awaiting_approval',
+      'running',
+      'paused',
+      'completed',
+      'blocked',
+      'failed',
+      'cancelled',
+    ].includes(data.status) &&
+    typeof data.stepsUsed === 'number' &&
+    Number.isInteger(data.stepsUsed) &&
+    data.stepsUsed >= 0 &&
+    data.stepsUsed <= 20 &&
+    typeof data.maxSteps === 'number' &&
+    Number.isInteger(data.maxSteps) &&
+    data.maxSteps >= 1 &&
+    data.maxSteps <= 20 &&
+    typeof data.modelCallsUsed === 'number' &&
+    Number.isInteger(data.modelCallsUsed) &&
+    data.modelCallsUsed >= 0 &&
+    data.modelCallsUsed <= 20 &&
+    typeof data.summary === 'string' &&
+    data.summary.length <= 2400 &&
     isTimestamp(data.createdAt) &&
     isTimestamp(data.updatedAt)
   );
@@ -397,6 +465,9 @@ function evaluateFirestoreRule(params: {
   // /users/{userId}/memories/{memoryId}
   if (segments.length === 4 && segments[0] === 'users' && segments[2] === 'memories') {
     const [, userId, , memoryId] = segments;
+    if (op === 'list') {
+      return isOwner(auth, userId) && existingData?.ownerId === auth?.uid ? 'ALLOW' : 'PERMISSION_DENIED';
+    }
     if (op === 'create') {
       const ok =
         isVerifiedUser(auth) &&
@@ -404,10 +475,142 @@ function evaluateFirestoreRule(params: {
         isValidId(userId) &&
         isValidId(memoryId) &&
         isValidCloudMemory(auth, incomingData) &&
-        hasAllKeys(incomingData, ['ownerId', 'label', 'content', 'category', 'createdAt', 'updatedAt']) &&
-        hasOnlyKeys(incomingData, ['ownerId', 'label', 'content', 'category', 'createdAt', 'updatedAt']) &&
+        hasAllKeys(incomingData, [
+          'ownerId',
+          'label',
+          'content',
+          'category',
+          'memoryType',
+          'projectId',
+          'referenceUrl',
+          'createdAt',
+          'updatedAt',
+        ]) &&
+        hasOnlyKeys(incomingData, [
+          'ownerId',
+          'label',
+          'content',
+          'category',
+          'memoryType',
+          'projectId',
+          'referenceUrl',
+          'createdAt',
+          'updatedAt',
+        ]) &&
         timestampsEqual(incomingData.createdAt, requestTime) &&
         timestampsEqual(incomingData.updatedAt, requestTime) &&
+        hasValidParentUser(state, auth, userId) &&
+        hasValidOptionalProjectRef(state, auth, userId, incomingData.projectId);
+      return ok ? 'ALLOW' : 'PERMISSION_DENIED';
+    }
+    if (op === 'update') {
+      if (!existingData) return 'PERMISSION_DENIED';
+      const ok =
+        isValidCloudMemory(auth, incomingData) &&
+        isVerifiedUser(auth) &&
+        isOwner(auth, userId) &&
+        isValidId(userId) &&
+        isValidId(memoryId) &&
+        incomingData.ownerId === existingData.ownerId &&
+        incomingData.projectId === existingData.projectId &&
+        timestampsEqual(incomingData.createdAt, existingData.createdAt) &&
+        timestampsEqual(incomingData.updatedAt, requestTime) &&
+        affectedKeysOnly(incomingData, existingData, [
+          'label',
+          'content',
+          'category',
+          'memoryType',
+          'referenceUrl',
+          'updatedAt',
+        ]) &&
+        hasValidParentUser(state, auth, userId);
+      return ok ? 'ALLOW' : 'PERMISSION_DENIED';
+    }
+  }
+
+  // /users/{userId}/missions/{missionId}
+  if (segments.length === 4 && segments[0] === 'users' && segments[2] === 'missions') {
+    const [, userId, , missionId] = segments;
+    if (op === 'list') {
+      return isOwner(auth, userId) && existingData?.ownerId === auth?.uid ? 'ALLOW' : 'PERMISSION_DENIED';
+    }
+    if (op === 'create') {
+      const ok =
+        isVerifiedUser(auth) &&
+        isOwner(auth, userId) &&
+        isValidId(userId) &&
+        isValidId(missionId) &&
+        isValidCloudMission(auth, incomingData) &&
+        hasAllKeys(incomingData, [
+          'ownerId',
+          'title',
+          'objective',
+          'projectId',
+          'status',
+          'stepsUsed',
+          'maxSteps',
+          'modelCallsUsed',
+          'summary',
+          'createdAt',
+          'updatedAt',
+        ]) &&
+        hasOnlyKeys(incomingData, [
+          'ownerId',
+          'title',
+          'objective',
+          'projectId',
+          'status',
+          'stepsUsed',
+          'maxSteps',
+          'modelCallsUsed',
+          'summary',
+          'createdAt',
+          'updatedAt',
+        ]) &&
+        incomingData.status !== 'completed' &&
+        incomingData.status !== 'cancelled' &&
+        timestampsEqual(incomingData.createdAt, requestTime) &&
+        timestampsEqual(incomingData.updatedAt, requestTime) &&
+        hasValidParentUser(state, auth, userId) &&
+        hasValidOptionalProjectRef(state, auth, userId, incomingData.projectId);
+      return ok ? 'ALLOW' : 'PERMISSION_DENIED';
+    }
+    if (op === 'update') {
+      if (!existingData) return 'PERMISSION_DENIED';
+      const activeProgress =
+        incomingData.status !== 'completed' &&
+        incomingData.status !== 'cancelled' &&
+        affectedKeysOnly(incomingData, existingData, [
+          'title',
+          'status',
+          'stepsUsed',
+          'modelCallsUsed',
+          'summary',
+          'updatedAt',
+        ]);
+      const terminalCompletion =
+        (incomingData.status === 'completed' || incomingData.status === 'cancelled') &&
+        affectedKeysOnly(incomingData, existingData, [
+          'status',
+          'stepsUsed',
+          'modelCallsUsed',
+          'summary',
+          'updatedAt',
+        ]);
+
+      const ok =
+        isValidCloudMission(auth, incomingData) &&
+        isVerifiedUser(auth) &&
+        isOwner(auth, userId) &&
+        isValidId(userId) &&
+        isValidId(missionId) &&
+        existingData.status !== 'completed' &&
+        existingData.status !== 'cancelled' &&
+        incomingData.ownerId === existingData.ownerId &&
+        incomingData.projectId === existingData.projectId &&
+        timestampsEqual(incomingData.createdAt, existingData.createdAt) &&
+        timestampsEqual(incomingData.updatedAt, requestTime) &&
+        (activeProgress || terminalCompletion) &&
         hasValidParentUser(state, auth, userId);
       return ok ? 'ALLOW' : 'PERMISSION_DENIED';
     }
@@ -417,7 +620,7 @@ function evaluateFirestoreRule(params: {
   return 'PERMISSION_DENIED';
 }
 
-test('Firestore Rules Spec: Structural & Blueprint synchronicity across all 4 collections', () => {
+test('Firestore Rules Spec: Structural & Blueprint synchronicity across all 5 collections', () => {
   const rulesText = fs.readFileSync(path.join(process.cwd(), 'firestore.rules'), 'utf8');
   const blueprint = JSON.parse(
     fs.readFileSync(path.join(process.cwd(), 'firebase-blueprint.json'), 'utf8')
@@ -430,11 +633,13 @@ test('Firestore Rules Spec: Structural & Blueprint synchronicity across all 4 co
   assert.match(rulesText, /match\s+\/\{document=\*\*\}\s*\{\s*allow\s+read,\s*write:\s*if\s+false;\s*\}/);
   assert.match(rulesText, /request\.auth\.token\.email_verified\s*==\s*true/);
   assert.match(rulesText, /existing\(\)\.status\s*!=\s*'archived'/);
+  assert.match(rulesText, /existing\(\)\.status\s*!=\s*'completed'/);
 
   // Every blueprint path has a corresponding match block in firestore.rules
   assert.deepEqual(Object.keys(blueprint.firestore).sort(), [
     '/users/{userId}',
     '/users/{userId}/memories/{memoryId}',
+    '/users/{userId}/missions/{missionId}',
     '/users/{userId}/private/{infoId}',
     '/users/{userId}/projects/{projectId}',
   ]);
@@ -442,10 +647,11 @@ test('Firestore Rules Spec: Structural & Blueprint synchronicity across all 4 co
   assert.match(rulesText, /match\s+\/private\/\{infoId\}/);
   assert.match(rulesText, /match\s+\/projects\/\{projectId\}/);
   assert.match(rulesText, /match\s+\/memories\/\{memoryId\}/);
+  assert.match(rulesText, /match\s+\/missions\/\{missionId\}/);
 
   // Ensure no get() or exists() calls appear inside any allow list statement
   const allowListMatches = rulesText.match(/allow\s+list:[^;]+;/g) ?? [];
-  assert.equal(allowListMatches.length, 4);
+  assert.equal(allowListMatches.length, 5);
   for (const listBlock of allowListMatches) {
     assert.equal(/\b(get|exists)\s*\(/.test(listBlock), false, `Forbidden DB lookup in allow list: ${listBlock}`);
   }
@@ -455,6 +661,8 @@ test('Firestore Rules Spec: Structural & Blueprint synchronicity across all 4 co
   assert.match(rulesText, /data\.brief\.size\(\)\s*<=\s*2400/);
   assert.equal(blueprint.entities.CloudMemory.properties.content.maxLength, 1200);
   assert.match(rulesText, /data\.content\.size\(\)\s*<=\s*1200/);
+  assert.equal(blueprint.entities.CloudMission.properties.objective.maxLength, 2000);
+  assert.match(rulesText, /data\.objective\.size\(\)\s*<=\s*2000/);
 });
 
 test('Firestore Rules Spec: All 12 "Dirty Dozen" adversarial payloads return PERMISSION_DENIED while verified owner succeeds', () => {
@@ -473,7 +681,7 @@ test('Firestore Rules Spec: All 12 "Dirty Dozen" adversarial payloads return PER
 
   const state: MockFirestoreState = { docs: new Map() };
 
-  // Positive control: Verified owner creates root profile, private PII, and active project
+  // Positive control: Verified owner creates root profile, private PII, active project, project memory, and mission
   const validProfile = {
     ownerId: 'uid_victim_01',
     displayName: 'Arenyx Builder',
@@ -535,6 +743,66 @@ test('Firestore Rules Spec: All 12 "Dirty Dozen" adversarial payloads return PER
     'ALLOW'
   );
   state.docs.set('/users/uid_victim_01/projects/proj_alpha', validProject);
+
+  const validMemory = {
+    ownerId: 'uid_victim_01',
+    label: 'Architecture Decision',
+    content: 'Use deterministic Sentinel gates before LLM calls.',
+    category: 'project-fact',
+    memoryType: 'decision',
+    projectId: 'proj_alpha',
+    referenceUrl: 'https://ai.google.dev',
+    createdAt: SERVER_NOW,
+    updatedAt: SERVER_NOW,
+  };
+  assert.equal(
+    evaluateFirestoreRule({
+      state,
+      auth: verifiedVictim,
+      op: 'create',
+      docPath: '/users/uid_victim_01/memories/mem_alpha_1',
+      incomingData: validMemory,
+    }),
+    'ALLOW'
+  );
+  state.docs.set('/users/uid_victim_01/memories/mem_alpha_1', validMemory);
+
+  const validMission = {
+    ownerId: 'uid_victim_01',
+    title: 'Security Verification Mission',
+    objective: 'Run deterministic checks and summarize findings.',
+    projectId: 'proj_alpha',
+    status: 'planned',
+    stepsUsed: 0,
+    maxSteps: 6,
+    modelCallsUsed: 0,
+    summary: '',
+    createdAt: SERVER_NOW,
+    updatedAt: SERVER_NOW,
+  };
+  assert.equal(
+    evaluateFirestoreRule({
+      state,
+      auth: verifiedVictim,
+      op: 'create',
+      docPath: '/users/uid_victim_01/missions/msn_alpha_1',
+      incomingData: validMission,
+    }),
+    'ALLOW'
+  );
+  state.docs.set('/users/uid_victim_01/missions/msn_alpha_1', validMission);
+
+  // Orphan project reference on memory creation is rejected
+  assert.equal(
+    evaluateFirestoreRule({
+      state,
+      auth: verifiedVictim,
+      op: 'create',
+      docPath: '/users/uid_victim_01/memories/mem_orphan_proj',
+      incomingData: { ...validMemory, projectId: 'proj_does_not_exist' },
+    }),
+    'PERMISSION_DENIED'
+  );
 
   // Dirty Dozen #1: Identity Spoofing on Profile Create
   assert.equal(
@@ -646,10 +914,7 @@ test('Firestore Rules Spec: All 12 "Dirty Dozen" adversarial payloads return PER
       op: 'create',
       docPath: '/users/uid_victim_01/memories/mem_forged_time',
       incomingData: {
-        ownerId: 'uid_victim_01',
-        label: 'Forged Note',
-        content: 'Backdated timestamp attempt',
-        category: 'note',
+        ...validMemory,
         createdAt: makeTimestamp(1_577_836_800_000),
         updatedAt: SERVER_NOW,
       },
@@ -657,7 +922,7 @@ test('Firestore Rules Spec: All 12 "Dirty Dozen" adversarial payloads return PER
     'PERMISSION_DENIED'
   );
 
-  // Dirty Dozen #10: Immutable Field Mutation (changing ownerId or createdAt on update)
+  // Dirty Dozen #10: Immutable Field Mutation (changing createdAt on project or projectId on memory)
   assert.equal(
     evaluateFirestoreRule({
       state,
@@ -672,8 +937,22 @@ test('Firestore Rules Spec: All 12 "Dirty Dozen" adversarial payloads return PER
     }),
     'PERMISSION_DENIED'
   );
+  assert.equal(
+    evaluateFirestoreRule({
+      state,
+      auth: verifiedVictim,
+      op: 'update',
+      docPath: '/users/uid_victim_01/memories/mem_alpha_1',
+      incomingData: {
+        ...validMemory,
+        projectId: '',
+        updatedAt: SERVER_NOW,
+      },
+    }),
+    'PERMISSION_DENIED'
+  );
 
-  // Dirty Dozen #11: Terminal State Unlock (updating a project after status == 'archived')
+  // Dirty Dozen #11: Terminal State Unlock (updating archived project OR completed mission)
   const archivedProject = {
     ...validProject,
     status: 'archived',
@@ -694,7 +973,28 @@ test('Firestore Rules Spec: All 12 "Dirty Dozen" adversarial payloads return PER
     'PERMISSION_DENIED'
   );
 
-  // Dirty Dozen #12: Value Poisoning on Whitelisted Update Key (name set to boolean / empty string)
+  const completedMission = {
+    ...validMission,
+    status: 'completed',
+    stepsUsed: 2,
+  };
+  state.docs.set('/users/uid_victim_01/missions/msn_done', completedMission);
+  assert.equal(
+    evaluateFirestoreRule({
+      state,
+      auth: verifiedVictim,
+      op: 'update',
+      docPath: '/users/uid_victim_01/missions/msn_done',
+      incomingData: {
+        ...completedMission,
+        status: 'running',
+        updatedAt: SERVER_NOW,
+      },
+    }),
+    'PERMISSION_DENIED'
+  );
+
+  // Dirty Dozen #12: Value Poisoning on Whitelisted Update Key (name set to empty string or stepsUsed > 20)
   assert.equal(
     evaluateFirestoreRule({
       state,
@@ -704,6 +1004,20 @@ test('Firestore Rules Spec: All 12 "Dirty Dozen" adversarial payloads return PER
       incomingData: {
         ...validProject,
         name: '' as unknown as string,
+        updatedAt: SERVER_NOW,
+      },
+    }),
+    'PERMISSION_DENIED'
+  );
+  assert.equal(
+    evaluateFirestoreRule({
+      state,
+      auth: verifiedVictim,
+      op: 'update',
+      docPath: '/users/uid_victim_01/missions/msn_alpha_1',
+      incomingData: {
+        ...validMission,
+        stepsUsed: 999,
         updatedAt: SERVER_NOW,
       },
     }),

@@ -157,7 +157,7 @@
     },
     "CloudMemory": {
       "title": "CloudMemory",
-      "description": "Explicitly saved user memory note isolated per authenticated UID.",
+      "description": "Explicitly saved user-approved memory note isolated per authenticated UID and optional projectId.",
       "type": "object",
       "properties": {
         "ownerId": {
@@ -185,6 +185,25 @@
           "maxLength": 24,
           "description": "Memory classification."
         },
+        "memoryType": {
+          "type": "string",
+          "enum": ["note", "decision", "goal", "summary", "reference"],
+          "maxLength": 16,
+          "description": "Structured v0.4 memory artifact kind."
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 128,
+          "pattern": "^$|^[a-zA-Z0-9_\\-]+$",
+          "description": "Immutable parent CloudProject ID (empty string when global)."
+        },
+        "referenceUrl": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 500,
+          "description": "Optional verified HTTPS reference URL."
+        },
         "createdAt": {
           "type": "string",
           "format": "date-time",
@@ -196,7 +215,106 @@
           "description": "Server update timestamp."
         }
       },
-      "required": ["ownerId", "label", "content", "category", "createdAt", "updatedAt"]
+      "required": [
+        "ownerId",
+        "label",
+        "content",
+        "category",
+        "memoryType",
+        "projectId",
+        "referenceUrl",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "CloudMission": {
+      "title": "CloudMission",
+      "description": "User-owned Mission Control run record with bounded execution counters and terminal completion lock.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Immutable Firebase Auth UID of the mission owner."
+        },
+        "title": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 120,
+          "description": "Mission plan title."
+        },
+        "objective": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 2000,
+          "description": "Structured mission objective."
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 128,
+          "pattern": "^$|^[a-zA-Z0-9_\\-]+$",
+          "description": "Immutable parent CloudProject ID (empty string when workspace-global)."
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "planned",
+            "awaiting_approval",
+            "running",
+            "paused",
+            "completed",
+            "blocked",
+            "failed",
+            "cancelled"
+          ],
+          "maxLength": 24,
+          "description": "Mission execution status; 'completed' and 'cancelled' are locked terminal states."
+        },
+        "stepsUsed": {
+          "type": "integer",
+          "description": "Bounded subtask execution steps consumed (0..20)."
+        },
+        "maxSteps": {
+          "type": "integer",
+          "description": "Configured step ceiling (1..20)."
+        },
+        "modelCallsUsed": {
+          "type": "integer",
+          "description": "Bounded model calls consumed (0..20)."
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 2400,
+          "description": "Mission execution and Sentinel verification summary."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Immutable server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "ownerId",
+        "title",
+        "objective",
+        "projectId",
+        "status",
+        "stepsUsed",
+        "maxSteps",
+        "modelCallsUsed",
+        "summary",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -214,7 +332,11 @@
     },
     "/users/{userId}/memories/{memoryId}": {
       "schema": { "$ref": "#/entities/CloudMemory" },
-      "description": "User-owned cloud-persisted memory notes."
+      "description": "User-owned cloud-persisted project and workspace memory notes."
+    },
+    "/users/{userId}/missions/{missionId}": {
+      "schema": { "$ref": "#/entities/CloudMission" },
+      "description": "User-owned cloud-persisted Mission Control workflow runs."
     }
   }
 }

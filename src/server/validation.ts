@@ -27,19 +27,69 @@ export const ResponseToneSchema = z.enum([
 
 export const ResponseLengthSchema = z.enum(['concise', 'standard', 'detailed']);
 
-export const ChatAttachmentSchema = z.object({
-  id: z.string().trim().min(1).max(80),
-  name: z.string().trim().min(1).max(160),
-  mimeType: z.string().trim().min(3).max(80),
-  kind: z.enum(['image', 'text']),
-  sizeBytes: z.number().int().min(1).max(1_048_576),
-  textContent: z.string().max(MAX_ATTACHMENT_TEXT_LENGTH).optional(),
-  base64Data: z
-    .string()
-    .max(MAX_ATTACHMENT_BASE64_LENGTH)
-    .regex(/^[A-Za-z0-9+/=\s]*$/, 'Invalid base64 encoding.')
-    .optional(),
-});
+export const SAFE_IMAGE_MIME_TYPES = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/webp',
+  'image/gif',
+]);
+
+export const SAFE_TEXT_MIME_TYPES = new Set([
+  'text/plain',
+  'text/markdown',
+  'text/csv',
+  'application/json',
+  'text/javascript',
+  'application/javascript',
+  'text/typescript',
+  'text/x-python',
+  'text/html',
+  'text/css',
+  'application/xml',
+  'text/xml',
+]);
+
+export const ChatAttachmentSchema = z
+  .object({
+    id: z.string().trim().min(1).max(80),
+    name: z.string().trim().min(1).max(160),
+    mimeType: z.string().trim().min(3).max(80),
+    kind: z.enum(['image', 'text']),
+    sizeBytes: z.number().int().min(1).max(1_048_576),
+    textContent: z.string().max(MAX_ATTACHMENT_TEXT_LENGTH).optional(),
+    base64Data: z
+      .string()
+      .max(MAX_ATTACHMENT_BASE64_LENGTH)
+      .regex(/^[A-Za-z0-9+/=\s]*$/, 'Invalid base64 encoding.')
+      .optional(),
+  })
+  .superRefine((att, ctx) => {
+    const normalizedMime = att.mimeType.toLowerCase();
+    if (att.kind === 'image') {
+      if (!SAFE_IMAGE_MIME_TYPES.has(normalizedMime)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `Unsupported image MIME type "${att.mimeType}". Allowed: PNG, JPEG, WEBP, GIF.`,
+          path: ['mimeType'],
+        });
+      }
+      if (!att.base64Data || att.base64Data.trim().length < 4) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'Image attachment requires valid base64Data.',
+          path: ['base64Data'],
+        });
+      }
+    } else {
+      if (!SAFE_TEXT_MIME_TYPES.has(normalizedMime)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `Unsupported text attachment MIME type "${att.mimeType}".`,
+          path: ['mimeType'],
+        });
+      }
+    }
+  });
 
 export const ChatMessageInputSchema = z.object({
   role: z.enum(['user', 'assistant']),
@@ -188,6 +238,14 @@ export const TaskWorkflowExecuteSchema = z.object({
   useSentinel: z.boolean().optional().default(true),
 });
 
+export const MemoryItemTypeSchema = z.enum([
+  'note',
+  'decision',
+  'goal',
+  'summary',
+  'reference',
+]);
+
 export const MemoryCreateSchema = z.object({
   label: z
     .string()
@@ -200,6 +258,40 @@ export const MemoryCreateSchema = z.object({
     .min(2, 'Memory content cannot be empty.')
     .max(MAX_MEMORY_LENGTH, `Memory content must be under ${MAX_MEMORY_LENGTH} characters.`),
   category: z.enum(['preference', 'project-fact', 'constraint', 'note']).default('note'),
+  memoryType: MemoryItemTypeSchema.optional().default('note'),
+  projectId: z.string().trim().max(120).optional(),
+  referenceUrl: z
+    .string()
+    .trim()
+    .max(500)
+    .refine(
+      (val) => !val || /^https?:\/\/[^\s]+$/i.test(val),
+      'Reference URL must use http:// or https://.'
+    )
+    .optional(),
+  approvedByUser: z.boolean().optional().default(true),
+});
+
+export const MemoryUpdateSchema = z.object({
+  label: z.string().trim().min(2).max(80).optional(),
+  content: z.string().trim().min(2).max(MAX_MEMORY_LENGTH).optional(),
+  category: z.enum(['preference', 'project-fact', 'constraint', 'note']).optional(),
+  memoryType: MemoryItemTypeSchema.optional(),
+  projectId: z.string().trim().max(120).optional(),
+  referenceUrl: z
+    .string()
+    .trim()
+    .max(500)
+    .refine(
+      (val) => !val || /^https?:\/\/[^\s]+$/i.test(val),
+      'Reference URL must use http:// or https://.'
+    )
+    .optional(),
+});
+
+export const MemorySettingsSchema = z.object({
+  globalEnabled: z.boolean().optional(),
+  disabledProjectIds: z.array(z.string().trim().min(1).max(120)).max(100).optional(),
 });
 
 export const DocumentIngestSchema = z.object({
@@ -232,6 +324,99 @@ export const StudioVisualRequestSchema = z.object({
   imageSize: z.enum(['1K', '2K', '4K']).default('1K'),
   qualityTier: z.enum(['general', 'studio']).default('studio'),
   generateFreeBlueprintFallback: z.boolean().optional().default(true),
+});
+
+export const MissionPlanSchema = z.object({
+  title: z
+    .string()
+    .trim()
+    .min(2, 'Mission title must be at least 2 characters.')
+    .max(120, 'Mission title must be under 120 characters.'),
+  objective: z
+    .string()
+    .trim()
+    .min(4, 'Mission objective must be at least 4 characters.')
+    .max(2000, 'Mission objective must be under 2,000 characters.'),
+  projectId: z.string().trim().max(120).optional(),
+  preferredAgent: AgentIdSchema.optional(),
+  requestedTools: z.array(z.string().trim().max(64)).max(5).optional().default([]),
+  requireHumanApproval: z.boolean().optional().default(false),
+  mockMode: z.boolean().optional().default(false),
+  maxSteps: z.number().int().min(2).max(8).optional().default(5),
+  maxRetries: z.number().int().min(0).max(2).optional().default(2),
+  maxElapsedMs: z.number().int().min(5000).max(45000).optional().default(30000),
+  maxModelCalls: z.number().int().min(1).max(4).optional().default(3),
+});
+
+export const MissionExecuteSchema = z.object({
+  mockMode: z.boolean().optional(),
+});
+
+export const MissionControlSchema = z.discriminatedUnion('action', [
+  z.object({ action: z.literal('pause') }),
+  z.object({ action: z.literal('resume') }),
+  z.object({ action: z.literal('cancel') }),
+  z.object({
+    action: z.literal('approve_task'),
+    taskId: z.string().trim().min(1).max(64),
+  }),
+  z.object({
+    action: z.literal('retry_task'),
+    taskId: z.string().trim().min(1).max(64),
+  }),
+]);
+
+export const DeepResearchRequestSchema = z.object({
+  query: z
+    .string()
+    .trim()
+    .min(4, 'Research question must be at least 4 characters.')
+    .max(1500, 'Research question must be under 1,500 characters.'),
+  projectId: z.string().trim().max(120).optional(),
+  mockMode: z.boolean().optional().default(false),
+});
+
+export const CouncilRoleIdSchema = z.enum([
+  'researcher',
+  'engineer',
+  'strategist',
+  'skeptical_reviewer',
+]);
+
+export const CouncilRequestSchema = z.object({
+  prompt: z
+    .string()
+    .trim()
+    .min(4, 'Council deliberation prompt must be at least 4 characters.')
+    .max(2000, 'Council prompt must be under 2,000 characters.'),
+  projectId: z.string().trim().max(120).optional(),
+  selectedRoles: z.array(CouncilRoleIdSchema).min(1).max(4).optional(),
+  maxCallBudget: z.number().int().min(1).max(4).optional().default(4),
+  maxCharsPerRole: z.number().int().min(400).max(2400).optional().default(1200),
+  mockMode: z.boolean().optional().default(false),
+});
+
+export const CodingLabFileSchema = z.object({
+  name: z
+    .string()
+    .trim()
+    .min(1, 'File name is required.')
+    .max(80)
+    .regex(/^[a-zA-Z0-9._/-]+$/, 'File name contains invalid path characters.')
+    .refine((n) => !n.includes('..'), 'Path traversal is not permitted.'),
+  language: z.string().trim().min(1).max(24).default('typescript'),
+  content: z.string().max(30_000),
+});
+
+export const CodingLabRequestSchema = z.object({
+  mode: z.enum(['inspect_and_review', 'generate_code', 'generate_test_plan']),
+  prompt: z
+    .string()
+    .trim()
+    .min(2, 'Coding Lab prompt must be at least 2 characters.')
+    .max(2000, 'Coding Lab prompt must be under 2,000 characters.'),
+  files: z.array(CodingLabFileSchema).max(8).optional().default([]),
+  mockMode: z.boolean().optional().default(false),
 });
 
 const SECRET_PATTERNS: RegExp[] = [

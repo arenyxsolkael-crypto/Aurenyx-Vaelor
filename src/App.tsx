@@ -15,6 +15,9 @@ import { TasksView } from './views/TasksView';
 import { AboutView } from './views/AboutView';
 import { SettingsView } from './views/SettingsView';
 import { AndroidAppView } from './views/AndroidAppView';
+import { MissionControlView } from './views/MissionControlView';
+import { CouncilView } from './views/CouncilView';
+import { CodingLabView } from './views/CodingLabView';
 import {
   TrustGridHomeView,
   TrustGridProductView,
@@ -75,9 +78,33 @@ export default function App() {
                   }
                 />
                 <Route
+                  path="/missions"
+                  element={
+                    <ProtectedRoute featureLabel="Mission Control DAG Workspace">
+                      <MissionControlView />
+                    </ProtectedRoute>
+                  }
+                />
+                <Route
+                  path="/council"
+                  element={
+                    <ProtectedRoute featureLabel="Aether Vanguard Council">
+                      <CouncilView />
+                    </ProtectedRoute>
+                  }
+                />
+                <Route
+                  path="/coding-lab"
+                  element={
+                    <ProtectedRoute featureLabel="Secure Coding Lab">
+                      <CodingLabView />
+                    </ProtectedRoute>
+                  }
+                />
+                <Route
                   path="/research"
                   element={
-                    <ProtectedRoute featureLabel="Research Mode">
+                    <ProtectedRoute featureLabel="Deep Research Studio">
                       <ResearchView />
                     </ProtectedRoute>
                   }

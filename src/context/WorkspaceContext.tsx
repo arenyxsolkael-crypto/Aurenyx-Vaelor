@@ -10,8 +10,10 @@ import React, {
 import { useAuth } from './AuthContext';
 import {
   deleteCloudMemoryFromFirestore,
+  deleteCloudMissionFromFirestore,
   deleteCloudProjectFromFirestore,
   syncCloudMemoryToFirestore,
+  syncCloudMissionToFirestore,
   syncCloudProjectToFirestore,
   syncVerifiedUserToFirestore,
 } from '../lib/firebase';
@@ -21,18 +23,29 @@ import type {
   AIStreamEvent,
   ChatAttachment,
   ChatMessage,
+  CodingLabAssistResult,
+  CodingLabFile,
+  CodingLabMode,
   Conversation,
+  CouncilRoleId,
+  CouncilSessionResult,
+  DeepResearchReport,
   EvaluationPromptCase,
   HealthResponse,
   ImageAspectRatio,
   ImageResolutionSize,
   KnowledgeDocument,
+  MemoryInjectionSettings,
+  MemoryItemType,
+  MissionRun,
   ProjectWorkspace,
   ResponseLength,
   ResponseTone,
+  RouterStatusSummary,
   SavedMemory,
   StructuredTaskRun,
   ToolAvailability,
+  ToolName,
   ToolStage,
 } from '../shared/types';
 
@@ -82,6 +95,7 @@ interface WorkspaceContextValue {
 
   gatewayState: GatewayStatusState;
   health: HealthResponse | null;
+  routerStatus: RouterStatusSummary | null;
   refreshHealth: () => Promise<void>;
 
   conversations: Conversation[];
@@ -197,6 +211,7 @@ interface WorkspaceContextValue {
 
   documents: KnowledgeDocument[];
   memories: SavedMemory[];
+  memorySettings: MemoryInjectionSettings;
   ingestDocument: (data: {
     title: string;
     fileName?: string;
@@ -208,8 +223,78 @@ interface WorkspaceContextValue {
     label: string;
     content: string;
     category: SavedMemory['category'];
+    memoryType?: MemoryItemType;
+    projectId?: string;
+    referenceUrl?: string;
+  }) => Promise<{ ok: boolean; memory?: SavedMemory; error?: string }>;
+  updateMemory: (
+    id: string,
+    patch: {
+      label?: string;
+      content?: string;
+      category?: SavedMemory['category'];
+      memoryType?: MemoryItemType;
+      projectId?: string;
+      referenceUrl?: string;
+    }
+  ) => Promise<{ ok: boolean; memory?: SavedMemory; error?: string }>;
+  updateMemorySettings: (settings: {
+    globalEnabled: boolean;
+    disabledProjectIds: string[];
   }) => Promise<{ ok: boolean; error?: string }>;
+  exportMemoriesJson: (projectId?: string) => Promise<{ ok: boolean; error?: string }>;
   removeMemory: (id: string) => Promise<void>;
+
+  missions: MissionRun[];
+  planMission: (data: {
+    title: string;
+    objective: string;
+    projectId?: string;
+    preferredAgent?: AgentId;
+    requestedTools?: ToolName[];
+    requireHumanApproval?: boolean;
+    mockMode?: boolean;
+    maxSteps?: number;
+    maxRetries?: number;
+    maxElapsedMs?: number;
+    maxModelCalls?: number;
+  }) => Promise<{ ok: boolean; mission?: MissionRun; error?: string }>;
+  executeMission: (
+    id: string,
+    options?: { mockMode?: boolean }
+  ) => Promise<{ ok: boolean; mission?: MissionRun; error?: string }>;
+  controlMission: (
+    id: string,
+    command: {
+      action: 'pause' | 'resume' | 'cancel' | 'retry_task' | 'approve_task';
+      taskId?: string;
+    }
+  ) => Promise<{ ok: boolean; mission?: MissionRun; error?: string }>;
+  removeMission: (id: string) => Promise<void>;
+
+  deepResearchReports: DeepResearchReport[];
+  runDeepResearch: (data: {
+    query: string;
+    projectId?: string;
+    mockMode?: boolean;
+  }) => Promise<{ ok: boolean; report?: DeepResearchReport; error?: string }>;
+
+  councilSessions: CouncilSessionResult[];
+  conveneCouncil: (data: {
+    prompt: string;
+    projectId?: string;
+    selectedRoles?: CouncilRoleId[];
+    maxCallBudget?: number;
+    maxCharsPerRole?: number;
+    mockMode?: boolean;
+  }) => Promise<{ ok: boolean; session?: CouncilSessionResult; error?: string }>;
+
+  runCodingLabAssist: (data: {
+    mode: CodingLabMode;
+    prompt: string;
+    files: CodingLabFile[];
+    mockMode?: boolean;
+  }) => Promise<{ ok: boolean; result?: CodingLabAssistResult; error?: string }>;
 
   agents: AgentWithStats[];
   tools: ToolInfo[];
@@ -217,7 +302,7 @@ interface WorkspaceContextValue {
   evaluationSuite: EvaluationPromptCase[];
   refreshWorkspaceData: () => Promise<void>;
   purgeSessionData: (
-    scope: 'conversations' | 'memories' | 'documents' | 'tasks' | 'all'
+    scope: 'conversations' | 'memories' | 'documents' | 'tasks' | 'missions' | 'all'
   ) => Promise<void>;
 }
 
@@ -298,6 +383,7 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const [gatewayState, setGatewayState] = useState<GatewayStatusState>('checking');
   const [health, setHealth] = useState<HealthResponse | null>(null);
+  const [routerStatus, setRouterStatus] = useState<RouterStatusSummary | null>(null);
 
   const initialConv = useMemo(() => makeEmptyConversation(undefined), []);
   const [conversations, setConversations] = useState<Conversation[]>(() => [initialConv]);
@@ -320,6 +406,14 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const [activeProjectId, setActiveProjectId] = useState<string | undefined>(undefined);
   const [documents, setDocuments] = useState<KnowledgeDocument[]>([]);
   const [memories, setMemories] = useState<SavedMemory[]>([]);
+  const [memorySettings, setMemorySettings] = useState<MemoryInjectionSettings>(() => ({
+    globalEnabled: true,
+    disabledProjectIds: [],
+    updatedAt: new Date(0).toISOString(),
+  }));
+  const [missions, setMissions] = useState<MissionRun[]>([]);
+  const [deepResearchReports, setDeepResearchReports] = useState<DeepResearchReport[]>([]);
+  const [councilSessions, setCouncilSessions] = useState<CouncilSessionResult[]>([]);
   const [agents, setAgents] = useState<AgentWithStats[]>([]);
   const [tools, setTools] = useState<ToolInfo[]>([]);
   const [tasks, setTasks] = useState<StructuredTaskRun[]>([]);
@@ -374,6 +468,14 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       setActiveProjectId(undefined);
       setDocuments([]);
       setMemories([]);
+      setMemorySettings({
+        globalEnabled: true,
+        disabledProjectIds: [],
+        updatedAt: new Date(0).toISOString(),
+      });
+      setMissions([]);
+      setDeepResearchReports([]);
+      setCouncilSessions([]);
       setTasks([]);
       setComposerError(null);
       return;
@@ -458,7 +560,16 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const refreshHealth = useCallback(async () => {
     try {
-      const res = await authFetch('/api/health');
+      const [res, routerRes] = await Promise.all([
+        authFetch('/api/health'),
+        authFetch(`/api/router/status?mockMode=${mockMode ? 'true' : 'false'}`),
+      ]);
+      if (routerRes.ok) {
+        const rData = (await routerRes.json()) as { router?: RouterStatusSummary };
+        if (rData.router) {
+          setRouterStatus(rData.router);
+        }
+      }
       if (res.status === 429) {
         return;
       }
@@ -472,7 +583,7 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     } catch {
       setGatewayState('offline');
     }
-  }, [authFetch]);
+  }, [authFetch, mockMode]);
 
   const refreshWorkspaceData = useCallback(async () => {
     try {
@@ -488,12 +599,16 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         return;
       }
 
-      const [projRes, knowRes, tasksRes, convRes] = await Promise.all([
-        authFetch('/api/projects'),
-        authFetch('/api/knowledge'),
-        authFetch('/api/tasks'),
-        authFetch('/api/conversations'),
-      ]);
+      const [projRes, knowRes, tasksRes, convRes, missionsRes, researchRes, councilRes] =
+        await Promise.all([
+          authFetch('/api/projects'),
+          authFetch('/api/knowledge'),
+          authFetch('/api/tasks'),
+          authFetch('/api/conversations'),
+          authFetch('/api/missions'),
+          authFetch('/api/research/reports'),
+          authFetch('/api/council/sessions'),
+        ]);
 
       if (projRes.ok) {
         const d = (await projRes.json()) as { projects: ProjectWorkspace[] };
@@ -508,9 +623,13 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         const d = (await knowRes.json()) as {
           documents: KnowledgeDocument[];
           memories: SavedMemory[];
+          memorySettings?: MemoryInjectionSettings;
         };
         setDocuments(d.documents ?? []);
         setMemories(d.memories ?? []);
+        if (d.memorySettings) {
+          setMemorySettings(d.memorySettings);
+        }
       }
       if (tasksRes.ok) {
         const d = (await tasksRes.json()) as {
@@ -519,6 +638,18 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         };
         setTasks(d.tasks ?? []);
         setEvaluationSuite(d.evaluationSuite ?? []);
+      }
+      if (missionsRes.ok) {
+        const d = (await missionsRes.json()) as { missions: MissionRun[] };
+        setMissions(d.missions ?? []);
+      }
+      if (researchRes.ok) {
+        const d = (await researchRes.json()) as { reports: DeepResearchReport[] };
+        setDeepResearchReports(d.reports ?? []);
+      }
+      if (councilRes.ok) {
+        const d = (await councilRes.json()) as { sessions: CouncilSessionResult[] };
+        setCouncilSessions(d.sessions ?? []);
       }
       if (convRes.ok) {
         const d = (await convRes.json()) as { conversations: Conversation[] };
@@ -1527,6 +1658,9 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       label: string;
       content: string;
       category: SavedMemory['category'];
+      memoryType?: MemoryItemType;
+      projectId?: string;
+      referenceUrl?: string;
     }) => {
       try {
         const res = await authFetch('/api/knowledge/memories', {
@@ -1545,12 +1679,104 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         }
         await refreshWorkspaceData();
         await refreshHealth();
-        return { ok: true };
+        return { ok: true, memory: json.memory };
       } catch {
         return { ok: false, error: 'Network error saving memory note.' };
       }
     },
     [authFetch, refreshWorkspaceData, refreshHealth, user]
+  );
+
+  const updateMemory = useCallback(
+    async (
+      id: string,
+      patch: {
+        label?: string;
+        content?: string;
+        category?: SavedMemory['category'];
+        memoryType?: MemoryItemType;
+        projectId?: string;
+        referenceUrl?: string;
+      }
+    ) => {
+      try {
+        const res = await authFetch(`/api/knowledge/memories/${encodeURIComponent(id)}`, {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(patch),
+        });
+        const json = (await res.json()) as { memory?: SavedMemory; error?: string };
+        if (!res.ok || !json.memory) {
+          return { ok: false, error: json.error || 'Could not update memory note.' };
+        }
+        if (user?.emailVerified) {
+          void syncCloudMemoryToFirestore(user, json.memory).catch(() => {});
+        }
+        await refreshWorkspaceData();
+        return { ok: true, memory: json.memory };
+      } catch {
+        return { ok: false, error: 'Network error updating memory note.' };
+      }
+    },
+    [authFetch, refreshWorkspaceData, user]
+  );
+
+  const updateMemorySettings = useCallback(
+    async (settings: { globalEnabled: boolean; disabledProjectIds: string[] }) => {
+      try {
+        const res = await authFetch('/api/knowledge/memory-settings', {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(settings),
+        });
+        const json = (await res.json()) as {
+          ok?: boolean;
+          memorySettings?: MemoryInjectionSettings;
+          error?: string;
+        };
+        if (!res.ok || !json.memorySettings) {
+          return { ok: false, error: json.error || 'Could not update memory injection settings.' };
+        }
+        setMemorySettings(json.memorySettings);
+        return { ok: true };
+      } catch {
+        return { ok: false, error: 'Network error updating memory injection settings.' };
+      }
+    },
+    [authFetch]
+  );
+
+  const exportMemoriesJson = useCallback(
+    async (projectId?: string) => {
+      try {
+        const qs =
+          projectId && projectId !== '__all__'
+            ? `?projectId=${encodeURIComponent(projectId)}`
+            : '';
+        const res = await authFetch(`/api/knowledge/memories/export${qs}`);
+        const json = (await res.json()) as { error?: string };
+        if (!res.ok) {
+          return { ok: false, error: json.error || 'Could not export memory bundle.' };
+        }
+        const blob = new Blob([JSON.stringify(json, null, 2)], {
+          type: 'application/json;charset=utf-8',
+        });
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = `vaelor-memories-${projectId && projectId !== '__all__' ? projectId : 'all'}.json`;
+        anchor.click();
+        URL.revokeObjectURL(url);
+        return { ok: true };
+      } catch {
+        return { ok: false, error: 'Network error exporting memory bundle.' };
+      }
+    },
+    [authFetch]
   );
 
   const removeMemory = useCallback(
@@ -1567,8 +1793,216 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     [authFetch, refreshWorkspaceData, refreshHealth, user]
   );
 
+  const planMission = useCallback(
+    async (data: {
+      title: string;
+      objective: string;
+      projectId?: string;
+      preferredAgent?: AgentId;
+      requestedTools?: ToolName[];
+      requireHumanApproval?: boolean;
+      mockMode?: boolean;
+      maxSteps?: number;
+      maxRetries?: number;
+      maxElapsedMs?: number;
+      maxModelCalls?: number;
+    }) => {
+      try {
+        const res = await authFetch('/api/missions/plan', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            ...data,
+            mockMode: data.mockMode ?? mockMode,
+          }),
+        });
+        const json = (await res.json()) as { mission?: MissionRun; error?: string };
+        if (!res.ok || !json.mission) {
+          return { ok: false, error: json.error || 'Could not create mission plan.' };
+        }
+        if (user?.emailVerified) {
+          void syncCloudMissionToFirestore(user, json.mission).catch(() => {});
+        }
+        await refreshWorkspaceData();
+        await refreshHealth();
+        return { ok: true, mission: json.mission };
+      } catch {
+        return { ok: false, error: 'Network error planning mission.' };
+      }
+    },
+    [authFetch, mockMode, refreshHealth, refreshWorkspaceData, user]
+  );
+
+  const executeMission = useCallback(
+    async (id: string, options?: { mockMode?: boolean }) => {
+      try {
+        const res = await authFetch(`/api/missions/${encodeURIComponent(id)}/execute`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            mockMode: options?.mockMode ?? mockMode,
+          }),
+        });
+        const json = (await res.json()) as { mission?: MissionRun; error?: string };
+        if (!res.ok || !json.mission) {
+          return { ok: false, error: json.error || 'Mission execution step failed.' };
+        }
+        if (user?.emailVerified) {
+          void syncCloudMissionToFirestore(user, json.mission).catch(() => {});
+        }
+        await refreshWorkspaceData();
+        await refreshHealth();
+        return { ok: true, mission: json.mission };
+      } catch {
+        return { ok: false, error: 'Network error executing mission.' };
+      }
+    },
+    [authFetch, mockMode, refreshHealth, refreshWorkspaceData, user]
+  );
+
+  const controlMission = useCallback(
+    async (
+      id: string,
+      command: {
+        action: 'pause' | 'resume' | 'cancel' | 'retry_task' | 'approve_task';
+        taskId?: string;
+      }
+    ) => {
+      try {
+        const res = await authFetch(`/api/missions/${encodeURIComponent(id)}/control`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(command),
+        });
+        const json = (await res.json()) as { mission?: MissionRun; error?: string };
+        if (!res.ok || !json.mission) {
+          return { ok: false, error: json.error || 'Mission control action failed.' };
+        }
+        if (user?.emailVerified) {
+          void syncCloudMissionToFirestore(user, json.mission).catch(() => {});
+        }
+        await refreshWorkspaceData();
+        return { ok: true, mission: json.mission };
+      } catch {
+        return { ok: false, error: 'Network error updating mission control state.' };
+      }
+    },
+    [authFetch, refreshWorkspaceData, user]
+  );
+
+  const removeMission = useCallback(
+    async (id: string) => {
+      await authFetch(`/api/missions/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      });
+      if (user?.emailVerified) {
+        void deleteCloudMissionFromFirestore(user, id).catch(() => {});
+      }
+      await refreshWorkspaceData();
+      await refreshHealth();
+    },
+    [authFetch, refreshHealth, refreshWorkspaceData, user]
+  );
+
+  const runDeepResearch = useCallback(
+    async (data: { query: string; projectId?: string; mockMode?: boolean }) => {
+      try {
+        const res = await authFetch('/api/research/deep', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            ...data,
+            mockMode: data.mockMode ?? mockMode,
+          }),
+        });
+        const json = (await res.json()) as { report?: DeepResearchReport; error?: string };
+        if (!res.ok || !json.report) {
+          return { ok: false, error: json.error || 'Deep research pipeline failed.' };
+        }
+        await refreshWorkspaceData();
+        return { ok: true, report: json.report };
+      } catch {
+        return { ok: false, error: 'Network error running Deep Research.' };
+      }
+    },
+    [authFetch, mockMode, refreshWorkspaceData]
+  );
+
+  const conveneCouncil = useCallback(
+    async (data: {
+      prompt: string;
+      projectId?: string;
+      selectedRoles?: CouncilRoleId[];
+      maxCallBudget?: number;
+      maxCharsPerRole?: number;
+      mockMode?: boolean;
+    }) => {
+      try {
+        const res = await authFetch('/api/council/convene', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            ...data,
+            mockMode: data.mockMode ?? mockMode,
+          }),
+        });
+        const json = (await res.json()) as { session?: CouncilSessionResult; error?: string };
+        if (!res.ok || !json.session) {
+          return { ok: false, error: json.error || 'Vanguard Council deliberation failed.' };
+        }
+        await refreshWorkspaceData();
+        return { ok: true, session: json.session };
+      } catch {
+        return { ok: false, error: 'Network error convening Vanguard Council.' };
+      }
+    },
+    [authFetch, mockMode, refreshWorkspaceData]
+  );
+
+  const runCodingLabAssist = useCallback(
+    async (data: {
+      mode: CodingLabMode;
+      prompt: string;
+      files: CodingLabFile[];
+      mockMode?: boolean;
+    }) => {
+      try {
+        const res = await authFetch('/api/coding-lab/assist', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            ...data,
+            mockMode: data.mockMode ?? mockMode,
+          }),
+        });
+        const json = (await res.json()) as { result?: CodingLabAssistResult; error?: string };
+        if (!res.ok || !json.result) {
+          return { ok: false, error: json.error || 'Coding Lab review failed.' };
+        }
+        return { ok: true, result: json.result };
+      } catch {
+        return { ok: false, error: 'Network error calling Coding Lab.' };
+      }
+    },
+    [authFetch, mockMode]
+  );
+
   const purgeSessionData = useCallback(
-    async (scope: 'conversations' | 'memories' | 'documents' | 'tasks' | 'all') => {
+    async (
+      scope: 'conversations' | 'memories' | 'documents' | 'tasks' | 'missions' | 'all'
+    ) => {
       await authFetch('/api/session/purge', {
         method: 'POST',
         headers: {
@@ -1591,6 +2025,8 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       }
       if (scope === 'all') {
         setActiveProjectId(undefined);
+        setDeepResearchReports([]);
+        setCouncilSessions([]);
       }
       await refreshWorkspaceData();
       await refreshHealth();
@@ -1608,6 +2044,7 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     setStreamingEnabled,
     gatewayState,
     health,
+    routerStatus,
     refreshHealth,
     conversations,
     activeConversation,
@@ -1656,10 +2093,24 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     executeWorkflowTask,
     documents,
     memories,
+    memorySettings,
     ingestDocument,
     removeDocument,
     saveMemory,
+    updateMemory,
+    updateMemorySettings,
+    exportMemoriesJson,
     removeMemory,
+    missions,
+    planMission,
+    executeMission,
+    controlMission,
+    removeMission,
+    deepResearchReports,
+    runDeepResearch,
+    councilSessions,
+    conveneCouncil,
+    runCodingLabAssist,
     agents,
     tools,
     tasks,

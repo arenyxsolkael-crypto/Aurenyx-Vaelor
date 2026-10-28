@@ -1,7 +1,7 @@
 export const OFFICIAL_ATTRIBUTION = {
   productName: 'AURENYX VAELOR',
-  version: '0.3',
-  releaseTitle: 'The Autonomous Intelligence Upgrade',
+  version: '0.4',
+  releaseTitle: 'Mission Control & Specialist Council',
   tagline: 'Intelligence, Orchestrated.',
   secondaryBrandLine: 'One Vision. Multiple Intelligences. A New Frontier.',
   category: 'General-Purpose AI Assistant and Intelligent Workflow Platform',
@@ -170,6 +170,12 @@ export interface SentinelReview {
   flags: string[];
   issues?: string[];
   unsupportedClaims?: string[];
+  verifiedFacts?: string[];
+  plausibleInferences?: string[];
+  unknowns?: string[];
+  contradictions?: string[];
+  completionCriteriaMet?: boolean;
+  incompleteEvidenceWarning?: string;
   citationChecks?: SentinelCitationCheck[];
   requiredCorrections?: string[];
   verificationLimitations?: string[];
@@ -236,6 +242,7 @@ export interface StructuredTaskRun {
   attachmentNames?: string[];
   result?: string;
   modelUsed?: string;
+  routeDecision?: ModelRouteDecision;
   error?: TaskErrorInfo;
   projectId?: string;
   conversationId?: string;
@@ -273,13 +280,26 @@ export interface Conversation {
   updatedAt: string;
 }
 
+export type MemoryItemType = 'note' | 'decision' | 'goal' | 'summary' | 'reference';
+
 export interface SavedMemory {
   id: string;
   label: string;
   content: string;
   category: 'preference' | 'project-fact' | 'constraint' | 'note';
+  memoryType?: MemoryItemType;
+  projectId?: string;
+  referenceUrl?: string;
+  approvedByUser?: boolean;
   ownerSessionId?: string;
   createdAt: string;
+  updatedAt?: string;
+}
+
+export interface MemoryInjectionSettings {
+  globalEnabled: boolean;
+  disabledProjectIds: string[];
+  updatedAt: string;
 }
 
 export interface DocumentChunk {
@@ -427,7 +447,9 @@ export interface HealthResponse {
     documents: number;
     projects: number;
     tasks: number;
+    missions?: number;
   };
+  routerOperatingMode?: RouterOperatingMode;
 }
 
 export interface AuthProviderStatusItem {
@@ -461,6 +483,7 @@ export interface AuthenticatedAccountSummary {
     documents: number;
     memories: number;
     tasks: number;
+    missions?: number;
   };
 }
 
@@ -493,3 +516,296 @@ export interface EvaluationPromptCase {
   expectedBehavior: string;
   expectedAgent?: AgentId;
 }
+
+// ============================================================================
+// AURENYX VAELOR v0.4 — Adaptive Model Router, Mission Control, Deep Research,
+// Vanguard Council, and Coding Lab Types
+// ============================================================================
+
+export type RouterOperatingMode =
+  | 'single-model'
+  | 'multi-model'
+  | 'mock'
+  | 'unconfigured';
+
+export type ModelRouteCapability =
+  | 'standard'
+  | 'fast_critic'
+  | 'deep_reasoning'
+  | 'vision'
+  | 'structured_json'
+  | 'grounded_search'
+  | 'coding';
+
+export interface ModelRouteDecision {
+  selectedModel: string;
+  fallbackModel?: string;
+  requestedTier: 'primary' | 'fast';
+  capability: ModelRouteCapability;
+  operatingMode: RouterOperatingMode;
+  reason: string;
+  timeoutMs: number;
+  maxRetries: number;
+  estimatedInputChars: number;
+  contextLimitChars: number;
+  contextTrimmed: boolean;
+  paidGuardrailActive: boolean;
+}
+
+export interface RouterStatusSummary {
+  provider: string;
+  configured: boolean;
+  operatingMode: RouterOperatingMode;
+  primaryModel: string;
+  fastModel: string;
+  reasoningModel: string;
+  distinctModelsConfigured: boolean;
+  paidModelsEnabled: boolean;
+  liveSearchAvailable: boolean;
+  maxContextTurns: number;
+  maxContextChars: number;
+  defaultTimeoutMs: number;
+  maxRetries: number;
+  disclosureNote: string;
+}
+
+export type MissionStatus =
+  | 'planned'
+  | 'awaiting_approval'
+  | 'running'
+  | 'paused'
+  | 'completed'
+  | 'blocked'
+  | 'failed'
+  | 'cancelled';
+
+export type MissionTaskStatus =
+  | 'queued'
+  | 'awaiting_approval'
+  | 'running'
+  | 'completed'
+  | 'blocked'
+  | 'failed';
+
+export interface MissionBounds {
+  maxSteps: number;
+  stepsUsed: number;
+  maxRetries: number;
+  retriesUsed: number;
+  maxElapsedMs: number;
+  elapsedMs: number;
+  maxModelCalls: number;
+  modelCallsUsed: number;
+}
+
+export interface MissionHistoryEvent {
+  id: string;
+  timestamp: string;
+  actor: 'user' | 'mission_controller' | 'sentinel';
+  eventType:
+    | 'planned'
+    | 'approval_requested'
+    | 'approved'
+    | 'task_started'
+    | 'task_completed'
+    | 'task_blocked'
+    | 'task_failed'
+    | 'paused'
+    | 'resumed'
+    | 'retried'
+    | 'cancelled'
+    | 'verified';
+  taskId?: string;
+  detail: string;
+}
+
+export interface MissionSubtask {
+  id: string;
+  title: string;
+  description: string;
+  dependencies: string[];
+  completionCriteria: string;
+  assignedAgent: AgentId;
+  toolName?: ToolName;
+  toolInputPreview?: Record<string, unknown>;
+  actionKind: 'proposed' | 'executed';
+  consequential: boolean;
+  requiresApproval: boolean;
+  approvedByUser: boolean;
+  approvedAt?: string;
+  status: MissionTaskStatus;
+  retryCount: number;
+  toolCallRecord?: ToolCallRecord;
+  outputSummary?: string;
+  error?: string;
+  startedAt?: string;
+  completedAt?: string;
+}
+
+export interface MissionRun {
+  id: string;
+  title: string;
+  objective: string;
+  projectId?: string;
+  status: MissionStatus;
+  subtasks: MissionSubtask[];
+  bounds: MissionBounds;
+  historyLog: MissionHistoryEvent[];
+  citations: CitationItem[];
+  routeDecision?: ModelRouteDecision;
+  sentinelReview?: SentinelReview;
+  finalSummary?: string;
+  mockMode?: boolean;
+  ownerSessionId?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type DeepResearchStageId =
+  | 'question_clarification'
+  | 'search'
+  | 'source_collection'
+  | 'source_comparison'
+  | 'synthesis'
+  | 'verification'
+  | 'final_report';
+
+export interface DeepResearchStageRecord {
+  id: DeepResearchStageId;
+  label: string;
+  status: 'completed' | 'degraded' | 'skipped' | 'failed';
+  summary: string;
+  durationMs: number;
+}
+
+export interface DeepResearchComparison {
+  topic: string;
+  agreementLevel: 'corroborated' | 'single_source' | 'contradictory' | 'insufficient_sources';
+  sourceIds: string[];
+  notes: string;
+}
+
+export interface DeepResearchClaim {
+  id: string;
+  statement: string;
+  epistemicClass: 'verified_fact' | 'plausible_inference' | 'unsupported' | 'unknown';
+  sourceIds: string[];
+  verificationNote: string;
+}
+
+export interface DeepResearchReport {
+  id: string;
+  query: string;
+  projectId?: string;
+  clarifiedQuestions: string[];
+  status: ResearchStatus;
+  statusLabel: string;
+  searchProviderUsed: string;
+  stages: DeepResearchStageRecord[];
+  sources: CitationItem[];
+  comparisons: DeepResearchComparison[];
+  claims: DeepResearchClaim[];
+  unsupportedStatements: string[];
+  uncertainties: string[];
+  executiveSummary: string;
+  reportMarkdown: string;
+  routeDecision?: ModelRouteDecision;
+  sentinelReview: SentinelReview;
+  isMockResponse?: boolean;
+  ownerSessionId?: string;
+  createdAt: string;
+  durationMs: number;
+}
+
+export type CouncilRoleId =
+  | 'researcher'
+  | 'engineer'
+  | 'strategist'
+  | 'skeptical_reviewer';
+
+export interface CouncilRoleOutput {
+  roleId: CouncilRoleId;
+  roleTitle: string;
+  mandate: string;
+  modelUsed: string;
+  analysis: string;
+  keyPoints: string[];
+  evidenceCited: string[];
+  risksOrCritiques: string[];
+  recommendation: string;
+  durationMs: number;
+}
+
+export interface CouncilSynthesis {
+  agreements: string[];
+  disagreements: string[];
+  evidenceSummary: string[];
+  unresolvedQuestions: string[];
+  recommendedAction: string;
+}
+
+export interface CouncilSessionResult {
+  id: string;
+  prompt: string;
+  projectId?: string;
+  selectedRoles: CouncilRoleId[];
+  roleOutputs: CouncilRoleOutput[];
+  synthesis: CouncilSynthesis;
+  operatingMode: RouterOperatingMode;
+  isIndependentMultiModel: boolean;
+  modelHonestyDisclosure: string;
+  callBudgetUsed: number;
+  maxCallBudget: number;
+  maxCharsPerRole: number;
+  sentinelReview: SentinelReview;
+  isMockResponse?: boolean;
+  ownerSessionId?: string;
+  createdAt: string;
+  durationMs: number;
+}
+
+export type CodingLabMode =
+  | 'inspect_and_review'
+  | 'generate_code'
+  | 'generate_test_plan';
+
+export interface CodingLabFile {
+  name: string;
+  language: string;
+  content: string;
+}
+
+export interface CodingLabStaticFinding {
+  severity: 'high' | 'medium' | 'low' | 'info';
+  file: string;
+  rule: string;
+  detail: string;
+}
+
+export interface CodingLabTestCase {
+  id: string;
+  title: string;
+  category: 'unit' | 'edge_case' | 'security' | 'validation';
+  targetFile: string;
+  expectedOutcome: string;
+}
+
+export interface CodingLabAssistResult {
+  id: string;
+  mode: CodingLabMode;
+  executedCode: false;
+  sandboxStatus: 'unavailable';
+  sandboxNotice: string;
+  summary: string;
+  staticFindings: CodingLabStaticFinding[];
+  generatedFiles: CodingLabFile[];
+  testCases: CodingLabTestCase[];
+  recommendedTestCommand: string;
+  routeDecision?: ModelRouteDecision;
+  sentinelReview: SentinelReview;
+  modelUsed: string;
+  isMockResponse?: boolean;
+  createdAt: string;
+  durationMs: number;
+}
+
