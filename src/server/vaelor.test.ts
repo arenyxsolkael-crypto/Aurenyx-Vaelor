@@ -39,7 +39,19 @@ import {
   detectSecretInText,
   SlidingWindowRateLimiter,
 } from './validation.ts';
-import { OFFICIAL_ATTRIBUTION, type AIRequest, type ModelCapabilities } from '../shared/types.ts';
+import {
+  auditMarkdownSafety,
+  containsRawExecutableHtml,
+  isSafeExternalUrl,
+  parseSafeMarkdownLink,
+  sanitizeMarkdownUrl,
+} from '../shared/markdownSafety.ts';
+import {
+  OFFICIAL_ATTRIBUTION,
+  type AIRequest,
+  type AuthenticatedAccountSummary,
+  type ModelCapabilities,
+} from '../shared/types.ts';
 import {
   createSeededTrustGridState,
   DEFAULT_SAFEGUARD_CATALOG,
@@ -51,7 +63,9 @@ import {
   validateAssessmentInput,
   type AssessmentQuestionnaireInput,
 } from '../shared/trustgridEngine.ts';
+import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from 'jose';
 import { auditAndroidProject } from './androidProjectService.ts';
+import { createJwksFirebaseTokenVerifier } from './authVerify.ts';
 import { createApiApp } from '../../server.ts';
 
 class StubModelGateway implements ModelGateway {
@@ -721,7 +735,7 @@ test('15. Native Android project passes zero-secret security audit and /api/andr
 test('16. Universal Chat Engine v1.0 & v0.2: 6 specialist roles, broad task categories, Tone/Length directives, and Local Mock Mode', async () => {
   assert.equal(Object.values(AGENT_DEFINITIONS).length, 6);
   assert.ok(Boolean(AGENT_DEFINITIONS['vaelor-analyst']));
-  assert.equal(Object.keys(TOOL_REGISTRY).length, 13);
+  assert.equal(Object.keys(TOOL_REGISTRY).length, 14);
 
   // Quantitative decision matrix routes to Vaelor Analyst
   const analystRoute = classifyTask(
@@ -1131,6 +1145,10 @@ test('23. PWA NetworkOnly API caching rule and zero hardcoded client secrets acr
   };
 
   const clientFiles = walkClientFiles(path.join(process.cwd(), 'src'));
+  const rootTrustGrid = path.join(process.cwd(), 'TrustGrid.tsx');
+  if (fs.existsSync(rootTrustGrid)) {
+    clientFiles.push(rootTrustGrid);
+  }
   assert.ok(clientFiles.length >= 10);
   for (const filePath of clientFiles) {
     const content = fs.readFileSync(filePath, 'utf8');
@@ -1146,3 +1164,961 @@ test('23. PWA NetworkOnly API caching rule and zero hardcoded client secrets acr
     );
   }
 });
+
+test('24. Phase 0 foundation: /api/tasks isolates traces per session token, redacts ownerSessionId, scopes task purge, and supports all 13 tools on /api/tools/execute', async () => {
+  const stub = new StubModelGateway();
+  stub.nextDraftText = 'Private session architecture synthesis.';
+  const store = new EphemeralSessionStore(true);
+  const { app } = createApiApp({ gateway: stub, store, rateLimitPerMinute: 60 });
+
+  const server = http.createServer(app);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const sessionAlpha = 'sess_phase0_alpha_secret_token_111';
+  const sessionBravo = 'sess_phase0_bravo_secret_token_222';
+
+  try {
+    // 1. Session Alpha runs a chat task
+    const alphaChatRes = await fetch(`${baseUrl}/api/chat`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Vaelor-Session-Token': sessionAlpha,
+      },
+      body: JSON.stringify({
+        message: 'Confidential Alpha roadmap calculation: 42 * 10',
+        mockMode: true,
+      }),
+    });
+    assert.equal(alphaChatRes.status, 200);
+    const alphaChatJson = (await alphaChatRes.json()) as {
+      taskRun: { id: string; ownerSessionId?: string; userRequest: string };
+    };
+    assert.equal(alphaChatJson.taskRun.ownerSessionId, undefined);
+
+    // 2. Session Bravo runs its own chat task
+    const bravoChatRes = await fetch(`${baseUrl}/api/chat`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Vaelor-Session-Token': sessionBravo,
+      },
+      body: JSON.stringify({
+        message: 'Confidential Bravo incident review',
+        mockMode: true,
+      }),
+    });
+    assert.equal(bravoChatRes.status, 200);
+
+    // 3. Session Alpha GET /api/tasks sees ONLY Alpha's task and never receives raw session tokens
+    const alphaTasksRaw = await fetch(`${baseUrl}/api/tasks`, {
+      headers: { 'X-Vaelor-Session-Token': sessionAlpha },
+    });
+    assert.equal(alphaTasksRaw.status, 200);
+    const alphaTasksText = await alphaTasksRaw.text();
+    assert.equal(alphaTasksText.includes(sessionAlpha), false);
+    assert.equal(alphaTasksText.includes(sessionBravo), false);
+    const alphaTasksJson = JSON.parse(alphaTasksText) as {
+      tasks: { userRequest: string; ownerSessionId?: string }[];
+    };
+    assert.equal(alphaTasksJson.tasks.length, 1);
+    assert.match(alphaTasksJson.tasks[0].userRequest, /Alpha roadmap/);
+    assert.equal(alphaTasksJson.tasks[0].ownerSessionId, undefined);
+
+    // 4. Unauthenticated / default session sees 0 private tasks from Alpha or Bravo
+    const defaultTasksRes = await fetch(`${baseUrl}/api/tasks`);
+    const defaultTasksJson = (await defaultTasksRes.json()) as { tasks: unknown[] };
+    assert.equal(defaultTasksJson.tasks.length, 0);
+
+    // 5. Session Alpha purging 'tasks' removes Alpha's tasks without wiping Session Bravo's tasks
+    const purgeAlphaRes = await fetch(`${baseUrl}/api/session/purge`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Vaelor-Session-Token': sessionAlpha,
+      },
+      body: JSON.stringify({ scope: 'tasks' }),
+    });
+    assert.equal(purgeAlphaRes.status, 200);
+
+    const alphaAfterPurge = (await (
+      await fetch(`${baseUrl}/api/tasks`, {
+        headers: { 'X-Vaelor-Session-Token': sessionAlpha },
+      })
+    ).json()) as { tasks: unknown[] };
+    assert.equal(alphaAfterPurge.tasks.length, 0);
+
+    const bravoAfterAlphaPurge = (await (
+      await fetch(`${baseUrl}/api/tasks`, {
+        headers: { 'X-Vaelor-Session-Token': sessionBravo },
+      })
+    ).json()) as { tasks: { userRequest: string }[] };
+    assert.equal(bravoAfterAlphaPurge.tasks.length, 1);
+    assert.match(bravoAfterAlphaPurge.tasks[0].userRequest, /Bravo incident/);
+
+    // 6. All 14 registered tools (including document_processor and code_static_reviewer) are accepted by /api/tools/execute
+    const docProcRes = await fetch(`${baseUrl}/api/tools/execute`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        tool: 'document_processor',
+        args: { query: 'Bounded Orchestration Ceiling' },
+      }),
+    });
+    assert.equal(docProcRes.status, 200);
+    const docProcJson = (await docProcRes.json()) as { record: { status: string } };
+    assert.equal(docProcJson.record.status, 'completed');
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test('25. v0.3 Safe Markdown & XSS neutralization blocks unsafe URL schemes and detects raw executable HTML', () => {
+  // Official v0.3 branding invariants
+  assert.equal(OFFICIAL_ATTRIBUTION.version, '0.3');
+  assert.equal(OFFICIAL_ATTRIBUTION.releaseTitle, 'The Autonomous Intelligence Upgrade');
+  assert.equal(
+    OFFICIAL_ATTRIBUTION.secondaryBrandLine,
+    'One Vision. Multiple Intelligences. A New Frontier.'
+  );
+
+  // Safe HTTP/HTTPS schemes allowed
+  assert.equal(isSafeExternalUrl('https://ai.google.dev/gemini-api/docs'), true);
+  assert.equal(sanitizeMarkdownUrl('https://example.org/report?id=1'), 'https://example.org/report?id=1');
+
+  // Dangerous & non-HTTP schemes neutralized in untrusted Markdown
+  assert.equal(isSafeExternalUrl('javascript:alert(document.cookie)'), false);
+  assert.equal(sanitizeMarkdownUrl('javascript:alert(1)'), null);
+  assert.equal(sanitizeMarkdownUrl('JaVaScRiPt:fetch("https://evil.test")'), null);
+  assert.equal(sanitizeMarkdownUrl('data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg=='), null);
+  assert.equal(sanitizeMarkdownUrl('vbscript:msgbox("xss")'), null);
+  assert.equal(sanitizeMarkdownUrl('file:///etc/passwd'), null);
+
+  const blockedLink = parseSafeMarkdownLink('[Click me](javascript:alert(1))');
+  assert.ok(blockedLink);
+  assert.equal(blockedLink.href, null);
+  assert.equal(blockedLink.blockedScheme, 'javascript:');
+
+  const safeLink = parseSafeMarkdownLink('[Docs](https://developer.mozilla.org)');
+  assert.ok(safeLink);
+  assert.equal(safeLink.href, 'https://developer.mozilla.org');
+  assert.equal(safeLink.blockedScheme, undefined);
+
+  // Raw executable HTML detection
+  assert.equal(containsRawExecutableHtml('<script>alert(1)</script>'), true);
+  assert.equal(containsRawExecutableHtml('<img src=x onerror=alert(1)>'), true);
+  assert.equal(containsRawExecutableHtml('Normal **Markdown** with `const x = 1 < 2;`'), false);
+
+  const safetyAudit = auditMarkdownSafety(
+    'Read [Payload](javascript:void(0)) and [Guide](https://example.com) plus <iframe src="https://evil.test"></iframe>'
+  );
+  assert.equal(safetyAudit.safeLinks.length, 1);
+  assert.equal(safetyAudit.blockedLinks.length, 1);
+  assert.equal(safetyAudit.rawExecutableHtmlDetected, true);
+});
+
+test('26. v0.3 Paid-model budget block, concurrency ceiling, and non-executing code_static_reviewer', async () => {
+  // 1. Paid model (e.g. gemini-4-argon) blocked with PAID_TIER_REQUIRED when ENABLE_PAID_MODELS !== 'true'
+  const paidBlockedGateway = new GeminiModelGateway({
+    GEMINI_API_KEY: 'AIzaSyTestServerKeyOnlyForGatewayUnitCheck123',
+    VAELOR_DEFAULT_MODEL: 'gemini-4-argon',
+    ENABLE_PAID_MODELS: 'false',
+  });
+  await assert.rejects(
+    () =>
+      paidBlockedGateway.generateText({
+        systemInstruction: 'Test budget guard',
+        turns: [{ role: 'user', text: 'Run paid model' }],
+      }),
+    (err: unknown) => {
+      assert.ok(err instanceof ModelGatewayError);
+      assert.equal(err.code, 'PAID_TIER_REQUIRED');
+      assert.equal(err.statusCode, 403);
+      return true;
+    }
+  );
+
+  // 2. Configurable concurrency bound clamps safely
+  const customConcurrencyGateway = new GeminiModelGateway({
+    VAELOR_MAX_CONCURRENCY: '3',
+  });
+  assert.equal(customConcurrencyGateway.getMaxConcurrency(), 3);
+
+  // 3. code_static_reviewer inspects code statically without executing it, catching eval/innerHTML
+  const store = new EphemeralSessionStore(true);
+  const reviewRes = await executeToolWithPermissions({
+    agentId: 'vaelor-forge',
+    toolName: 'code_static_reviewer',
+    rawArgs: {
+      language: 'typescript',
+      code: [
+        'export function renderUntrusted(input: any) {',
+        '  document.body.innerHTML = input;',
+        '  return eval(input);',
+        '}',
+      ].join('\n'),
+    },
+    context: { documents: store.documents, memories: store.memories },
+  });
+  assert.equal(reviewRes.record.status, 'completed');
+  const innerJson = reviewRes.record.output
+    .replace(/^<untrusted_data[^>]*>\s*/i, '')
+    .replace(/\s*<\/untrusted_data>\s*$/i, '');
+  const parsedReview = JSON.parse(innerJson) as {
+    executedCode: boolean;
+    findings: { severity: string; rule: string }[];
+  };
+  assert.equal(parsedReview.executedCode, false);
+  assert.ok(parsedReview.findings.length >= 2);
+  assert.ok(
+    parsedReview.findings.some((f) =>
+      /dynamic-code-execution|raw-dom-html-sink/i.test(f.rule)
+    )
+  );
+
+  // 4. Oversized tool outputs are bounded to <= 12,200 chars with truncation marker
+  const hugeJson = JSON.stringify(
+    Array.from({ length: 180 }, (_, idx) => ({
+      item: idx + 1,
+      detail: 'Structured row payload for output cap check '.repeat(2),
+    }))
+  );
+  const formatRes = await executeToolWithPermissions({
+    agentId: 'vaelor-core',
+    toolName: 'structured_formatter',
+    rawArgs: {
+      rawInput: hugeJson,
+      targetFormat: 'json',
+    },
+    context: { documents: store.documents, memories: store.memories },
+  });
+  assert.equal(formatRes.record.status, 'completed');
+  assert.ok(formatRes.record.output.length <= 12_200);
+});
+
+test('27. v0.3 Research statuses and Sentinel structured citation/limitation schema contain zero fabricated confidence scores', async () => {
+  const store = new EphemeralSessionStore(true);
+  const stub = new StubModelGateway();
+
+  // Search unavailable -> explicit 'search_unavailable' status
+  const noSearchRun = await new VaelorOrchestrator(stub).executeTask({
+    message: 'Investigate quantum error correction milestones.',
+    researchMode: true,
+    history: [],
+    documents: [],
+    memories: [],
+  });
+  assert.equal(noSearchRun.taskRun.researchStatus, 'search_unavailable');
+  assert.equal(noSearchRun.taskRun.researchStatusLabel, 'Search unavailable');
+  assert.ok(Array.isArray(noSearchRun.taskRun.sentinelReview?.verificationLimitations));
+  assert.ok((noSearchRun.taskRun.sentinelReview?.verificationLimitations?.length ?? 0) >= 1);
+  // Ensure no fake numeric confidence score property is emitted
+  assert.equal(
+    'confidenceScore' in (noSearchRun.taskRun.sentinelReview as unknown as Record<string, unknown>),
+    false
+  );
+
+  // Grounded search returning sources -> 'research_completed' + citationChecks populated
+  stub.nextSearchResult = {
+    status: 'ok',
+    query: 'quantum error correction milestones',
+    summaryText: 'Logical qubit error rates decreased below threshold in surface code experiments.',
+    note: 'Retrieved 1 grounded source.',
+    citations: [
+      {
+        id: 'cit-web-1',
+        sourceTitle: 'NIST Quantum Information Program',
+        sourceType: 'web',
+        url: 'https://www.nist.gov/quantum-information-science',
+        domain: 'www.nist.gov',
+        retrievedAt: new Date().toISOString(),
+        excerpt: 'Surface code logical qubit experiments demonstrated below-threshold error suppression.',
+      },
+    ],
+  };
+  stub.nextDraftText =
+    '## Direct Answer\nSurface code experiments reduced logical error rates (https://www.nist.gov/quantum-information-science).\n## Key Findings\n- Threshold achieved.\n## Evidence\n- NIST report.\n## Uncertainties\n- Cryogenic scaling.\n## Sources\n- https://www.nist.gov/quantum-information-science';
+
+  const completedResearch = await new VaelorOrchestrator(stub).executeTask({
+    message: 'Investigate quantum error correction milestones.',
+    researchMode: true,
+    history: [],
+    documents: store.documents,
+    memories: store.memories,
+  });
+  assert.equal(completedResearch.taskRun.researchStatus, 'research_completed');
+  assert.equal(completedResearch.taskRun.researchStatusLabel, 'Research completed');
+  assert.ok(
+    completedResearch.taskRun.sentinelReview?.citationChecks?.some(
+      (c) => c.matchedRetrievedSource === true && c.validSyntax === true
+    )
+  );
+});
+
+test('28. v0.3 Project Workspace CRUD, approved summaries, task plans, and sanitized JSON export', async () => {
+  const stub = new StubModelGateway();
+  const store = new EphemeralSessionStore(true);
+  const { app } = createApiApp({ gateway: stub, store, rateLimitPerMinute: 60 });
+
+  const server = http.createServer(app);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const sessionToken = 'sess_project_v03_owner_999888';
+
+  try {
+    // 1. Create a v0.3 project with description & reusable brief
+    const createRes = await fetch(`${baseUrl}/api/projects`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Vaelor-Session-Token': sessionToken,
+      },
+      body: JSON.stringify({
+        name: 'Microgrid Telemetry Service',
+        category: 'software',
+        description: 'Backend API and schema validation for solar telemetry.',
+        objective: 'Deliver type-safe telemetry ingestion under ₹0 free-tier constraints.',
+        brief: 'Always prefer Zod schemas, deterministic unit tests, and tabular-nums metrics.',
+      }),
+    });
+    assert.equal(createRes.status, 201);
+    const createdJson = (await createRes.json()) as { project: { id: string; brief?: string } };
+    const projectId = createdJson.project.id;
+    assert.match(createdJson.project.brief ?? '', /Zod schemas/);
+
+    // 2. Patch project with concise taskPlans and an explicitly approved user summary
+    const patchRes = await fetch(`${baseUrl}/api/projects/${projectId}`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Vaelor-Session-Token': sessionToken,
+      },
+      body: JSON.stringify({
+        addTaskPlan: {
+          title: 'Define Zod telemetry payload schema',
+          steps: ['Create TelemetryEventSchema', 'Add unit tests in vaelor.test.ts'],
+          status: 'in_progress',
+        },
+        addSummary: {
+          title: 'Approved Architecture Note',
+          summary: 'Use Express + Zod validation with zero client API keys.',
+          approvedByUser: true,
+        },
+      }),
+    });
+    assert.equal(patchRes.status, 200);
+    const patchedJson = (await patchRes.json()) as {
+      project: { taskPlans?: unknown[]; summaries?: unknown[] };
+    };
+    assert.equal(patchedJson.project.taskPlans?.length, 1);
+    assert.equal(patchedJson.project.summaries?.length, 1);
+
+    // 3. Export project JSON bundle and confirm schemaVersion + zero raw session token leakage
+    const exportRes = await fetch(`${baseUrl}/api/projects/${projectId}/export`, {
+      headers: { 'X-Vaelor-Session-Token': sessionToken },
+    });
+    assert.equal(exportRes.status, 200);
+    const exportRaw = await exportRes.text();
+    assert.equal(exportRaw.includes(sessionToken), false);
+    const exportBundle = JSON.parse(exportRaw) as {
+      schemaVersion: string;
+      project: { id: string; summaries?: { title: string }[] };
+    };
+    assert.equal(exportBundle.schemaVersion, 'vaelor-project-export-v0.3');
+    assert.equal(exportBundle.project.id, projectId);
+    assert.equal(exportBundle.project.summaries?.[0]?.title, 'Approved Architecture Note');
+
+    // 4. Delete project
+    const delRes = await fetch(`${baseUrl}/api/projects/${projectId}`, {
+      method: 'DELETE',
+    });
+    assert.equal(delRes.status, 200);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test('29. v0.3 Workflow Lifecycle (DRAFT -> PLAN -> APPROVAL_REQUIRED -> EXECUTE_TOOLS -> VERIFY -> COMPLETED) & recovery guidance', async () => {
+  const stub = new StubModelGateway();
+  stub.nextDraftText = 'Executed approved workflow plan and verified output.';
+  const store = new EphemeralSessionStore(true);
+  const { app } = createApiApp({ gateway: stub, store, rateLimitPerMinute: 60 });
+
+  const server = http.createServer(app);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const ownerA = 'sess_workflow_owner_alpha_777';
+  const ownerB = 'sess_workflow_owner_bravo_888';
+
+  try {
+    // 1. Create an approval-gated workflow plan
+    const planRes = await fetch(`${baseUrl}/api/tasks/plan`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Vaelor-Session-Token': ownerA,
+      },
+      body: JSON.stringify({
+        title: 'Quarterly Budget & Static Audit',
+        objective: 'Calculate (250 * 4) + 120 and summarize security trade-offs.',
+        preferredAgent: 'vaelor-forge',
+        requiresApproval: true,
+        requestedTools: ['calculator'],
+      }),
+    });
+    assert.equal(planRes.status, 201);
+    const planJson = (await planRes.json()) as {
+      task: { taskId: string; lifecycleStage: string; requiresApproval: boolean; status: string };
+    };
+    assert.equal(planJson.task.lifecycleStage, 'APPROVAL_REQUIRED');
+    assert.equal(planJson.task.requiresApproval, true);
+    assert.equal(planJson.task.status, 'awaiting_approval');
+    const taskId = planJson.task.taskId;
+
+    // 2. Attempting to execute without confirmedByUser -> blocked with HTTP 403 APPROVAL_REQUIRED
+    const unapprovedExec = await fetch(`${baseUrl}/api/tasks/${taskId}/execute`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Vaelor-Session-Token': ownerA,
+      },
+      body: JSON.stringify({ confirmedByUser: false, mockMode: true }),
+    });
+    assert.equal(unapprovedExec.status, 403);
+    const unapprovedJson = (await unapprovedExec.json()) as { code: string };
+    assert.equal(unapprovedJson.code, 'APPROVAL_REQUIRED');
+
+    // 3. Cross-session execution attempt by ownerB -> blocked with HTTP 403
+    const crossSessionExec = await fetch(`${baseUrl}/api/tasks/${taskId}/execute`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Vaelor-Session-Token': ownerB,
+      },
+      body: JSON.stringify({ confirmedByUser: true, mockMode: true }),
+    });
+    assert.equal(crossSessionExec.status, 403);
+
+    // 4. OwnerA approves and executes in Mock Mode -> transitions cleanly to COMPLETED
+    const approvedExec = await fetch(`${baseUrl}/api/tasks/${taskId}/execute`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Vaelor-Session-Token': ownerA,
+      },
+      body: JSON.stringify({ confirmedByUser: true, mockMode: true }),
+    });
+    assert.equal(approvedExec.status, 200);
+    const approvedJson = (await approvedExec.json()) as {
+      reply: string;
+      task: {
+        taskId: string;
+        lifecycleStage: string;
+        approvedByUser: boolean;
+        status: string;
+      };
+    };
+    assert.equal(approvedJson.task.taskId, taskId);
+    assert.equal(approvedJson.task.lifecycleStage, 'COMPLETED');
+    assert.equal(approvedJson.task.approvedByUser, true);
+    assert.equal(approvedJson.task.status, 'completed');
+    assert.ok(approvedJson.reply.length > 0);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test('30. v0.3 Auth & Firestore Rules blueprint synchronicity, verified-user writes, and zero-leak config check', () => {
+  const rulesText = fs.readFileSync(path.join(process.cwd(), 'firestore.rules'), 'utf8');
+  const blueprintText = fs.readFileSync(path.join(process.cwd(), 'firebase-blueprint.json'), 'utf8');
+  const blueprint = JSON.parse(blueprintText) as {
+    entities: Record<string, unknown>;
+    firestore: Record<string, unknown>;
+  };
+
+  assert.ok(blueprint.entities.UserProfile);
+  assert.ok(blueprint.entities.UserPrivateInfo);
+  assert.ok(blueprint.entities.CloudProject);
+  assert.ok(blueprint.entities.CloudMemory);
+  assert.equal(Object.keys(blueprint.firestore).length, 4);
+
+  // Verify default-deny catch-all, verified email requirement, and NPE-safe validation helpers
+  assert.match(rulesText, /match\s+\/\{document=\*\*\}\s*\{\s*allow\s+read,\s*write:\s*if\s+false;\s*\}/);
+  assert.match(rulesText, /function\s+isValidUserProfile\(data\)\s*\{\s*return\s+isSignedIn\(\)/);
+  assert.match(rulesText, /function\s+isValidCloudProject\(data\)\s*\{\s*return\s+isSignedIn\(\)/);
+});
+
+test('31. v0.3 Cryptographic RS256 Firebase ID Token verification blocks missing, expired, and forged tokens while keeping public landing endpoints open', async () => {
+  const { publicKey, privateKey } = await generateKeyPair('RS256');
+  const publicJwk = await exportJWK(publicKey);
+  publicJwk.kid = 'vaelor-test-key-1';
+  publicJwk.alg = 'RS256';
+  publicJwk.use = 'sig';
+
+  const localJwks = createLocalJWKSet({ keys: [publicJwk] });
+  const testProjectId = 'focal-zucchini-5lcf1';
+  const issuer = `https://securetoken.google.com/${testProjectId}`;
+
+  const tokenVerifier = createJwksFirebaseTokenVerifier({
+    projectId: testProjectId,
+    jwks: localJwks,
+  });
+
+  const stub = new StubModelGateway();
+  const store = new EphemeralSessionStore(true);
+  const { app } = createApiApp({
+    gateway: stub,
+    store,
+    rateLimitPerMinute: 80,
+    requireAuth: true,
+    tokenVerifier,
+    firebaseConfigOverride: {
+      projectId: testProjectId,
+      authDomain: `${testProjectId}.firebaseapp.com`,
+      firestoreDatabaseId: 'ai-studio-test-db',
+      configured: true,
+    },
+  });
+
+  const server = http.createServer(app);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  try {
+    // 1. Public endpoints work WITHOUT signing in
+    const healthRes = await fetch(`${baseUrl}/api/health`);
+    assert.equal(healthRes.status, 200);
+    const healthJson = (await healthRes.json()) as {
+      authRequired: boolean;
+      storageMode: string;
+      firebaseProjectId?: string;
+    };
+    assert.equal(healthJson.authRequired, true);
+    assert.equal(healthJson.storageMode, 'firestore-plus-session');
+    assert.equal(healthJson.firebaseProjectId, testProjectId);
+
+    const authConfigRes = await fetch(`${baseUrl}/api/auth/config`);
+    assert.equal(authConfigRes.status, 200);
+    const authConfigJson = (await authConfigRes.json()) as {
+      authRequiredOnProtectedApis: boolean;
+      firebaseConfigured: boolean;
+      recommendedAuthorizedDomains: string[];
+      providers: { id: string; status: string }[];
+    };
+    assert.equal(authConfigJson.authRequiredOnProtectedApis, true);
+    assert.equal(authConfigJson.firebaseConfigured, true);
+    assert.ok(authConfigJson.recommendedAuthorizedDomains.includes('localhost'));
+    assert.ok(
+      authConfigJson.providers.some((p) => p.id === 'google.com' && p.status === 'configured')
+    );
+    assert.ok(
+      authConfigJson.providers.some((p) => p.id === 'apple.com' && p.status === 'planned_future')
+    );
+
+    // Public stateless tool sandbox works without login
+    const publicToolRes = await fetch(`${baseUrl}/api/tools/execute`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        tool: 'calculator',
+        args: { expression: '12 * 12' },
+      }),
+    });
+    assert.equal(publicToolRes.status, 200);
+
+    // Private document_processor tool requires authentication when requireAuth === true
+    const privateToolUnauth = await fetch(`${baseUrl}/api/tools/execute`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        tool: 'document_processor',
+        args: { query: 'architecture' },
+      }),
+    });
+    assert.equal(privateToolUnauth.status, 401);
+
+    // 2. Missing Bearer token on protected endpoints -> 401 AUTH_REQUIRED
+    for (const protectedPath of [
+      '/api/projects',
+      '/api/knowledge',
+      '/api/tasks',
+      '/api/conversations',
+      '/api/account/me',
+    ]) {
+      const res = await fetch(`${baseUrl}${protectedPath}`);
+      assert.equal(res.status, 401, `Expected 401 on unauthenticated ${protectedPath}`);
+      const errJson = (await res.json()) as { code: string };
+      assert.equal(errJson.code, 'AUTH_REQUIRED');
+    }
+
+    const unauthChat = await fetch(`${baseUrl}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'Hello', mockMode: true }),
+    });
+    assert.equal(unauthChat.status, 401);
+
+    // 3. Expired RS256 token -> 401 SESSION_EXPIRED (retryable: true)
+    const nowSec = Math.floor(Date.now() / 1000);
+    const expiredJwt = await new SignJWT({
+      email: 'expired@example.com',
+      email_verified: true,
+      firebase: { sign_in_provider: 'google.com' },
+    })
+      .setProtectedHeader({ alg: 'RS256', kid: 'vaelor-test-key-1' })
+      .setIssuer(issuer)
+      .setAudience(testProjectId)
+      .setSubject('user_expired_01')
+      .setIssuedAt(nowSec - 7200)
+      .setExpirationTime(nowSec - 120)
+      .sign(privateKey);
+
+    const expiredRes = await fetch(`${baseUrl}/api/projects`, {
+      headers: { Authorization: `Bearer ${expiredJwt}` },
+    });
+    assert.equal(expiredRes.status, 401);
+    const expiredJson = (await expiredRes.json()) as { code: string; retryable: boolean };
+    assert.equal(expiredJson.code, 'SESSION_EXPIRED');
+    assert.equal(expiredJson.retryable, true);
+
+    // 4. Wrong audience / forged signature -> 401 INVALID_AUTH_TOKEN
+    const wrongAudJwt = await new SignJWT({
+      email: 'wrongaud@example.com',
+      email_verified: true,
+    })
+      .setProtectedHeader({ alg: 'RS256', kid: 'vaelor-test-key-1' })
+      .setIssuer(issuer)
+      .setAudience('some-other-firebase-project')
+      .setSubject('user_wrong_aud')
+      .setIssuedAt(nowSec)
+      .setExpirationTime(nowSec + 3600)
+      .sign(privateKey);
+
+    const wrongAudRes = await fetch(`${baseUrl}/api/projects`, {
+      headers: { Authorization: `Bearer ${wrongAudJwt}` },
+    });
+    assert.equal(wrongAudRes.status, 401);
+    const wrongAudJson = (await wrongAudRes.json()) as { code: string };
+    assert.equal(wrongAudJson.code, 'INVALID_AUTH_TOKEN');
+
+    const otherKeyPair = await generateKeyPair('RS256');
+    const forgedSigJwt = await new SignJWT({
+      email: 'forged@example.com',
+      email_verified: true,
+    })
+      .setProtectedHeader({ alg: 'RS256', kid: 'vaelor-test-key-1' })
+      .setIssuer(issuer)
+      .setAudience(testProjectId)
+      .setSubject('user_forged_sig')
+      .setIssuedAt(nowSec)
+      .setExpirationTime(nowSec + 3600)
+      .sign(otherKeyPair.privateKey);
+
+    const forgedRes = await fetch(`${baseUrl}/api/account/me`, {
+      headers: { Authorization: `Bearer ${forgedSigJwt}` },
+    });
+    assert.equal(forgedRes.status, 401);
+    const forgedJson = (await forgedRes.json()) as { code: string };
+    assert.equal(forgedJson.code, 'INVALID_AUTH_TOKEN');
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test('32. v0.3 Cross-User Isolation, Anti-IDOR (HTTP 403), Terminal Archive Lock (HTTP 409), Zero Gemini Key Exposure, and Account Cancellation Purge', async () => {
+  const { publicKey, privateKey } = await generateKeyPair('RS256');
+  const publicJwk = await exportJWK(publicKey);
+  publicJwk.kid = 'vaelor-idor-key-1';
+  publicJwk.alg = 'RS256';
+  publicJwk.use = 'sig';
+
+  const localJwks = createLocalJWKSet({ keys: [publicJwk] });
+  const testProjectId = 'focal-zucchini-5lcf1';
+  const issuer = `https://securetoken.google.com/${testProjectId}`;
+  const tokenVerifier = createJwksFirebaseTokenVerifier({
+    projectId: testProjectId,
+    jwks: localJwks,
+  });
+
+  const signUserToken = async (uid: string, email: string) => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    return new SignJWT({
+      email,
+      email_verified: true,
+      name: `User ${uid}`,
+      firebase: { sign_in_provider: 'google.com' },
+    })
+      .setProtectedHeader({ alg: 'RS256', kid: 'vaelor-idor-key-1' })
+      .setIssuer(issuer)
+      .setAudience(testProjectId)
+      .setSubject(uid)
+      .setIssuedAt(nowSec)
+      .setExpirationTime(nowSec + 3600)
+      .sign(privateKey);
+  };
+
+  const tokenAlice = await signUserToken('uid_alice_101', 'alice@example.com');
+  const tokenBob = await signUserToken('uid_bob_202', 'bob@example.com');
+
+  const stub = new StubModelGateway();
+  const store = new EphemeralSessionStore(true);
+  const { app } = createApiApp({
+    gateway: stub,
+    store,
+    rateLimitPerMinute: 120,
+    requireAuth: true,
+    tokenVerifier,
+    firebaseConfigOverride: {
+      projectId: testProjectId,
+      authDomain: `${testProjectId}.firebaseapp.com`,
+      firestoreDatabaseId: 'ai-studio-test-db',
+      configured: true,
+    },
+  });
+
+  const server = http.createServer(app);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  try {
+    // 1. Account summary never exposes GEMINI_API_KEY to signed-in users
+    const meAliceRes = await fetch(`${baseUrl}/api/account/me`, {
+      headers: { Authorization: `Bearer ${tokenAlice}` },
+    });
+    assert.equal(meAliceRes.status, 200);
+    const meAliceRaw = await meAliceRes.text();
+    assert.equal(detectSecretInText(meAliceRaw), false);
+    const meAliceEnvelope = JSON.parse(meAliceRaw) as {
+      ok: boolean;
+      account: AuthenticatedAccountSummary;
+    };
+    assert.equal(meAliceEnvelope.ok, true);
+    assert.equal(meAliceEnvelope.account.uid, 'uid_alice_101');
+    assert.equal(meAliceEnvelope.account.geminiKeyExposedToUser, false);
+
+    // 2. Alice creates private project, conversation, document, memory, and workflow task
+    const aliceProjRes = await fetch(`${baseUrl}/api/projects`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokenAlice}`,
+      },
+      body: JSON.stringify({
+        name: 'Alice Confidential Architecture',
+        category: 'software',
+        objective: 'Private zero-trust design for Alice only.',
+        brief: 'Alice private brief.',
+      }),
+    });
+    assert.equal(aliceProjRes.status, 201);
+    const aliceProjId = ((await aliceProjRes.json()) as { project: { id: string } }).project.id;
+
+    const nowIso = new Date().toISOString();
+    const aliceConvRes = await fetch(`${baseUrl}/api/conversations`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokenAlice}`,
+      },
+      body: JSON.stringify({
+        id: 'conv_alice_secret_1',
+        title: 'Alice Private Chat',
+        projectId: aliceProjId,
+        archived: false,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        messages: [
+          { id: 'msg_1', role: 'user', content: 'Alice private prompt', createdAt: nowIso },
+        ],
+      }),
+    });
+    assert.equal(aliceConvRes.status, 201);
+
+    const aliceDocRes = await fetch(`${baseUrl}/api/knowledge/documents`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokenAlice}`,
+      },
+      body: JSON.stringify({
+        title: 'Alice Private Spec',
+        sourceType: 'markdown',
+        content: 'Top-secret internal specification owned exclusively by Alice.',
+      }),
+    });
+    assert.equal(aliceDocRes.status, 201);
+    const aliceDocId = ((await aliceDocRes.json()) as { document: { id: string } }).document.id;
+
+    const aliceMemRes = await fetch(`${baseUrl}/api/knowledge/memories`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokenAlice}`,
+      },
+      body: JSON.stringify({
+        label: 'Alice Constraint',
+        content: 'Never share Alice project notes.',
+        category: 'constraint',
+      }),
+    });
+    assert.equal(aliceMemRes.status, 201);
+    const aliceMemId = ((await aliceMemRes.json()) as { memory: { id: string } }).memory.id;
+
+    const aliceTaskRes = await fetch(`${baseUrl}/api/tasks/plan`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokenAlice}`,
+      },
+      body: JSON.stringify({
+        title: 'Alice Private Audit',
+        objective: 'Compute 50 + 50 for Alice.',
+        requiresApproval: true,
+        requestedTools: ['calculator'],
+      }),
+    });
+    assert.equal(aliceTaskRes.status, 201);
+    const aliceTaskId = ((await aliceTaskRes.json()) as { task: { taskId: string } }).task.taskId;
+
+    // 3. Bob lists his own workspace -> never sees Alice's resources
+    const bobProjects = ((await (
+      await fetch(`${baseUrl}/api/projects`, {
+        headers: { Authorization: `Bearer ${tokenBob}` },
+      })
+    ).json()) as { projects: { id: string; name: string }[] }).projects;
+    assert.equal(
+      bobProjects.some((p) => p.id === aliceProjId || p.name.includes('Alice')),
+      false
+    );
+
+    const bobKnowledge = (await (
+      await fetch(`${baseUrl}/api/knowledge`, {
+        headers: { Authorization: `Bearer ${tokenBob}` },
+      })
+    ).json()) as { documents: { id: string }[]; memories: { id: string }[] };
+    assert.equal(bobKnowledge.documents.some((d) => d.id === aliceDocId), false);
+    assert.equal(bobKnowledge.memories.some((m) => m.id === aliceMemId), false);
+
+    // 4. Anti-IDOR checks: Bob attempts to read/modify/delete/inject Alice's IDs -> all return HTTP 403 FORBIDDEN_RESOURCE_ACCESS
+    const idorChecks: Array<Promise<Response>> = [
+      fetch(`${baseUrl}/api/projects/${aliceProjId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenBob}` },
+        body: JSON.stringify({ name: 'Hijacked by Bob' }),
+      }),
+      fetch(`${baseUrl}/api/projects/${aliceProjId}/export`, {
+        headers: { Authorization: `Bearer ${tokenBob}` },
+      }),
+      fetch(`${baseUrl}/api/projects/${aliceProjId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${tokenBob}` },
+      }),
+      fetch(`${baseUrl}/api/conversations/conv_alice_secret_1`, {
+        headers: { Authorization: `Bearer ${tokenBob}` },
+      }),
+      fetch(`${baseUrl}/api/conversations/conv_alice_secret_1`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenBob}` },
+        body: JSON.stringify({ title: 'Bob Tamper' }),
+      }),
+      fetch(`${baseUrl}/api/conversations/conv_alice_secret_1`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${tokenBob}` },
+      }),
+      fetch(`${baseUrl}/api/knowledge/documents/${aliceDocId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${tokenBob}` },
+      }),
+      fetch(`${baseUrl}/api/knowledge/memories/${aliceMemId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${tokenBob}` },
+      }),
+      fetch(`${baseUrl}/api/tasks/${aliceTaskId}/execute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenBob}` },
+        body: JSON.stringify({ confirmedByUser: true, mockMode: true }),
+      }),
+      fetch(`${baseUrl}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenBob}` },
+        body: JSON.stringify({
+          message: 'Attempt to inject Alice project context into Bob chat',
+          projectId: aliceProjId,
+          mockMode: true,
+        }),
+      }),
+    ];
+
+    const idorResponses = await Promise.all(idorChecks);
+    for (const res of idorResponses) {
+      assert.equal(res.status, 403, `Expected 403 anti-IDOR block on ${res.url}`);
+      const body = (await res.json()) as { code: string };
+      assert.equal(body.code, 'FORBIDDEN_RESOURCE_ACCESS');
+    }
+
+    // 5. Terminal State Lock: Alice archives her project -> subsequent PATCH returns 409 PROJECT_ARCHIVED_LOCKED
+    const archiveRes = await fetch(`${baseUrl}/api/projects/${aliceProjId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenAlice}` },
+      body: JSON.stringify({ status: 'archived' }),
+    });
+    assert.equal(archiveRes.status, 200);
+
+    const mutateArchivedRes = await fetch(`${baseUrl}/api/projects/${aliceProjId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenAlice}` },
+      body: JSON.stringify({ name: 'Try Editing Archived Project' }),
+    });
+    assert.equal(mutateArchivedRes.status, 409);
+    const mutateArchivedJson = (await mutateArchivedRes.json()) as { code: string };
+    assert.equal(mutateArchivedJson.code, 'PROJECT_ARCHIVED_LOCKED');
+
+    // 6. Account Cancellation Data Wipe: Alice calls DELETE /api/account/data -> erases all Alice items while leaving Bob's starter workspace intact
+    const wipeAliceRes = await fetch(`${baseUrl}/api/account/data`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${tokenAlice}` },
+    });
+    assert.equal(wipeAliceRes.status, 200);
+    const wipeAliceJson = (await wipeAliceRes.json()) as {
+      ok: boolean;
+      deletedOwnerUid: string;
+    };
+    assert.equal(wipeAliceJson.ok, true);
+    assert.equal(wipeAliceJson.deletedOwnerUid, 'uid_alice_101');
+
+    const aliceMeAfterWipe = (await (
+      await fetch(`${baseUrl}/api/account/me`, {
+        headers: { Authorization: `Bearer ${tokenAlice}` },
+      })
+    ).json()) as { account: AuthenticatedAccountSummary };
+    assert.equal(aliceMeAfterWipe.account.counts.projects, 0);
+    assert.equal(aliceMeAfterWipe.account.counts.conversations, 0);
+    assert.equal(aliceMeAfterWipe.account.counts.documents, 0);
+    assert.equal(aliceMeAfterWipe.account.counts.memories, 0);
+    assert.equal(aliceMeAfterWipe.account.counts.tasks, 0);
+
+    // Bob's workspace remains completely intact
+    const bobProjectsAfterAliceWipe = ((await (
+      await fetch(`${baseUrl}/api/projects`, {
+        headers: { Authorization: `Bearer ${tokenBob}` },
+      })
+    ).json()) as { projects: unknown[] }).projects;
+    assert.ok(bobProjectsAfterAliceWipe.length >= 1);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+
+

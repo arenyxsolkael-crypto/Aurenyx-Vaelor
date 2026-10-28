@@ -1,9 +1,12 @@
 import { BrowserRouter, Route, Routes } from 'react-router-dom';
+import { AuthProvider, useAuth } from './context/AuthContext';
 import { WorkspaceProvider } from './context/WorkspaceContext';
 import { TrustGridProvider } from './context/TrustGridContext';
 import { AppLayout } from './components/AppLayout';
+import { ProtectedRoute } from './components/ProtectedRoute';
 import { ChatView } from './views/ChatView';
 import { OverviewLandingView } from './views/OverviewLandingView';
+import { AuthView } from './views/AuthView';
 import { ResearchView } from './views/ResearchView';
 import { ProjectsView } from './views/ProjectsView';
 import { AgentsView } from './views/AgentsView';
@@ -38,50 +41,165 @@ import {
   TrustGridTermsView,
 } from './views/trustgrid/TrustGridGovernancePages';
 
+/**
+ * Public landing page loads without login when signed out;
+ * authenticated users land directly in their private Chat workspace.
+ */
+function HomeEntryRoute() {
+  const { user } = useAuth();
+  return user ? <ChatView /> : <OverviewLandingView />;
+}
+
 export default function App() {
   return (
     <BrowserRouter>
-      <WorkspaceProvider>
-        <TrustGridProvider>
-          <Routes>
-            <Route element={<AppLayout />}>
-              {/* Vaelor Multi-Agent Intelligence Workspace */}
-              <Route path="/" element={<ChatView />} />
-              <Route path="/chat" element={<ChatView />} />
-              <Route path="/overview" element={<OverviewLandingView />} />
-              <Route path="/research" element={<ResearchView />} />
-              <Route path="/projects" element={<ProjectsView />} />
-              <Route path="/agents" element={<AgentsView />} />
-              <Route path="/knowledge" element={<KnowledgeView />} />
-              <Route path="/tasks" element={<TasksView />} />
-              <Route path="/android" element={<AndroidAppView />} />
-              <Route path="/settings" element={<SettingsView />} />
+      <AuthProvider>
+        <WorkspaceProvider>
+          <TrustGridProvider>
+            <Routes>
+              <Route element={<AppLayout />}>
+                {/* Public Entry & Authentication Routes (No login required for landing/overview/about) */}
+                <Route path="/" element={<HomeEntryRoute />} />
+                <Route path="/overview" element={<OverviewLandingView />} />
+                <Route path="/auth" element={<AuthView />} />
+                <Route path="/about" element={<AboutView />} />
+                <Route path="/android" element={<AndroidAppView />} />
 
-              {/* Aurenyx TrustGrid AI Workflow Governance Suite */}
-              <Route path="/trustgrid" element={<TrustGridHomeView />} />
-              <Route path="/dashboard" element={<TrustGridDashboardView />} />
-              <Route path="/demo" element={<TrustGridDemoView />} />
-              <Route path="/product" element={<TrustGridProductView />} />
-              <Route path="/solutions" element={<TrustGridSolutionsView />} />
-              <Route path="/passport" element={<TrustGridPassportView />} />
-              <Route path="/assessment" element={<TrustGridAssessmentView />} />
-              <Route path="/risk-rules" element={<TrustGridRiskRulesView />} />
-              <Route path="/testing" element={<TrustGridTestingView />} />
-              <Route path="/safeguards" element={<TrustGridSafeguardsView />} />
-              <Route path="/reports" element={<TrustGridReportsView />} />
-              <Route path="/implementation" element={<TrustGridImplementationView />} />
-              <Route path="/about" element={<AboutView />} />
-              <Route path="/contact" element={<TrustGridContactView />} />
-              <Route path="/privacy" element={<TrustGridPrivacyView />} />
-              <Route path="/terms" element={<TrustGridTermsView />} />
-              <Route path="/faq" element={<TrustGridFaqView />} />
+                {/* Protected Private Vaelor Workspace Routes */}
+                <Route
+                  path="/chat"
+                  element={
+                    <ProtectedRoute featureLabel="Chat & Multi-Agent Workspace">
+                      <ChatView />
+                    </ProtectedRoute>
+                  }
+                />
+                <Route
+                  path="/research"
+                  element={
+                    <ProtectedRoute featureLabel="Research Mode">
+                      <ResearchView />
+                    </ProtectedRoute>
+                  }
+                />
+                <Route
+                  path="/projects"
+                  element={
+                    <ProtectedRoute featureLabel="Project Workspaces">
+                      <ProjectsView />
+                    </ProtectedRoute>
+                  }
+                />
+                <Route
+                  path="/agents"
+                  element={
+                    <ProtectedRoute featureLabel="Specialist Agents & Tools">
+                      <AgentsView />
+                    </ProtectedRoute>
+                  }
+                />
+                <Route
+                  path="/knowledge"
+                  element={
+                    <ProtectedRoute featureLabel="Knowledge & Saved Memory">
+                      <KnowledgeView />
+                    </ProtectedRoute>
+                  }
+                />
+                <Route
+                  path="/tasks"
+                  element={
+                    <ProtectedRoute featureLabel="Task Workflows & Evaluation">
+                      <TasksView />
+                    </ProtectedRoute>
+                  }
+                />
+                <Route
+                  path="/settings"
+                  element={
+                    <ProtectedRoute featureLabel="Account, Privacy & Settings">
+                      <SettingsView />
+                    </ProtectedRoute>
+                  }
+                />
+                <Route
+                  path="/account"
+                  element={
+                    <ProtectedRoute featureLabel="Account & Privacy Settings">
+                      <SettingsView />
+                    </ProtectedRoute>
+                  }
+                />
 
-              {/* Custom 404 Not Found Page */}
-              <Route path="*" element={<NotFoundView />} />
-            </Route>
-          </Routes>
-        </TrustGridProvider>
-      </WorkspaceProvider>
+                {/* Public TrustGrid Marketing, Demo, Governance & Legal Pages */}
+                <Route path="/trustgrid" element={<TrustGridHomeView />} />
+                <Route path="/demo" element={<TrustGridDemoView />} />
+                <Route path="/product" element={<TrustGridProductView />} />
+                <Route path="/solutions" element={<TrustGridSolutionsView />} />
+                <Route path="/risk-rules" element={<TrustGridRiskRulesView />} />
+                <Route path="/implementation" element={<TrustGridImplementationView />} />
+                <Route path="/contact" element={<TrustGridContactView />} />
+                <Route path="/privacy" element={<TrustGridPrivacyView />} />
+                <Route path="/terms" element={<TrustGridTermsView />} />
+                <Route path="/faq" element={<TrustGridFaqView />} />
+
+                {/* Protected Private TrustGrid Workspace Views */}
+                <Route
+                  path="/dashboard"
+                  element={
+                    <ProtectedRoute featureLabel="TrustGrid Governance Dashboard">
+                      <TrustGridDashboardView />
+                    </ProtectedRoute>
+                  }
+                />
+                <Route
+                  path="/passport"
+                  element={
+                    <ProtectedRoute featureLabel="AI Workflow Passports">
+                      <TrustGridPassportView />
+                    </ProtectedRoute>
+                  }
+                />
+                <Route
+                  path="/assessment"
+                  element={
+                    <ProtectedRoute featureLabel="Risk Assessment Engine">
+                      <TrustGridAssessmentView />
+                    </ProtectedRoute>
+                  }
+                />
+                <Route
+                  path="/testing"
+                  element={
+                    <ProtectedRoute featureLabel="TrustGrid Scenario Testing">
+                      <TrustGridTestingView />
+                    </ProtectedRoute>
+                  }
+                />
+                <Route
+                  path="/safeguards"
+                  element={
+                    <ProtectedRoute featureLabel="Safeguards Catalog">
+                      <TrustGridSafeguardsView />
+                    </ProtectedRoute>
+                  }
+                />
+                <Route
+                  path="/reports"
+                  element={
+                    <ProtectedRoute featureLabel="TrustGrid Reports & Exports">
+                      <TrustGridReportsView />
+                    </ProtectedRoute>
+                  }
+                />
+
+                {/* Custom 404 Not Found Page */}
+                <Route path="*" element={<NotFoundView />} />
+              </Route>
+            </Routes>
+          </TrustGridProvider>
+        </WorkspaceProvider>
+      </AuthProvider>
     </BrowserRouter>
   );
 }

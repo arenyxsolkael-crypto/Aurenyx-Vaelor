@@ -30,7 +30,7 @@ export const ResearchView: React.FC = () => {
     const structuredPrompt = [
       `Research Investigation Topic: ${cleanTopic}`,
       constraints.trim() ? `Scope & Constraints: ${constraints.trim()}` : '',
-      'Please structure your analysis into the 5-part Aurenyx Research v0.2 format:',
+      'Please structure your analysis into the 5-part Vaelor Research v0.3 format:',
       '1. Direct Answer',
       '2. Key Findings',
       '3. Evidence & Citations (cite retrieved web sources or indexed session documents strictly when verified)',
@@ -74,7 +74,7 @@ export const ResearchView: React.FC = () => {
         <div className="space-y-1.5">
           <div className="flex items-center gap-2 text-xs text-[#a58ff8]">
             <Compass className="h-4 w-4" />
-            <span>Aurenyx Research Specialist · v0.2 Grounded Synthesis</span>
+            <span>Vaelor Research Specialist · v0.3 Grounded Synthesis</span>
           </div>
           <h1 className="text-2xl font-bold tracking-tight text-[#f6f4fc]">
             Research Mode & Source Honesty Studio
@@ -114,8 +114,8 @@ export const ResearchView: React.FC = () => {
                   searchMode === 'gemini-google-search'
                     ? 'server-side Gemini Google Search Grounding'
                     : 'SEARCH_API_KEY'
-                } plus your ${documents.length} indexed session documents. If upstream search quota is throttled or returns zero web chunks, Aurenyx Research reports that transparently without inventing URLs.`
-              : `No server API key is currently active for live search. Aurenyx Research synthesizes established domain knowledge and your ${documents.length} indexed session documents, while explicitly flagging live prices, breaking news, or unverified URLs under Uncertainties & Limitations.`}
+                } plus your ${documents.length} indexed session documents. If upstream search quota is throttled or returns zero web chunks, Vaelor Research reports that transparently without inventing URLs.`
+              : `No server API key is currently active for live search. Vaelor Research synthesizes established domain knowledge and your ${documents.length} indexed session documents, while explicitly flagging live prices, breaking news, or unverified URLs under Uncertainties & Limitations.`}
           </p>
         </section>
 
@@ -165,9 +165,9 @@ export const ResearchView: React.FC = () => {
               <button
                 type="submit"
                 disabled={topic.trim().length < 3}
-                className="inline-flex min-h-[42px] items-center gap-2 rounded-xl bg-[#8b6ff7] px-4 py-2 text-xs font-semibold text-[#0b0a10] hover:bg-[#9f86fa] disabled:opacity-40 whitespace-nowrap"
+                className="inline-flex min-h-[44px] items-center gap-2 rounded-xl bg-[#8b6ff7] px-4 py-2 text-xs font-semibold text-[#0b0a10] hover:bg-[#9f86fa] disabled:opacity-40 whitespace-nowrap"
               >
-                <span>Open in Aurenyx Research</span>
+                <span>Open in Vaelor Research</span>
                 <ArrowRight className="h-4 w-4" />
               </button>
 
@@ -175,7 +175,7 @@ export const ResearchView: React.FC = () => {
                 type="button"
                 disabled={topic.trim().length < 3 || loadingMatrix}
                 onClick={() => void handlePreviewMatrix()}
-                className="inline-flex min-h-[42px] items-center gap-1.5 rounded-xl border border-white/12 bg-[#0e0c16] px-3.5 py-2 text-xs font-medium text-[#e4dff2] hover:border-white/25 disabled:opacity-40 whitespace-nowrap"
+                className="inline-flex min-h-[44px] items-center gap-1.5 rounded-xl border border-white/12 bg-[#0e0c16] px-3.5 py-2 text-xs font-medium text-[#e4dff2] hover:border-white/25 disabled:opacity-40 whitespace-nowrap"
               >
                 <FileSearch className="h-3.5 w-3.5 text-[#a58ff8]" />
                 <span>{loadingMatrix ? 'Checking rubric…' : 'Preview Evidence Rubric'}</span>

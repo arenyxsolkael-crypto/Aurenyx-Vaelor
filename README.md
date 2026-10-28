@@ -1,10 +1,10 @@
-# AURENYX VAELOR & AURENYX TRUSTGRID (Version 0.1)
+# AURENYX VAELOR & AURENYX TRUSTGRID (Version 0.3 — The Autonomous Intelligence Upgrade)
 
-**Intelligence, Orchestrated.** • **Intelligence. Integrity. Infinity.**
+**Intelligence, Orchestrated.** • **One Vision. Multiple Intelligences. A New Frontier.** • **Intelligence. Integrity. Infinity.**
 
 > **Official Founding Attribution:**  
 > *“AURENYX VAELOR — Founded by The Aether Vanguard, founded by Arenyx Sol Kael.”*
-> - **Parent Platform:** AURENYX VAELOR (`v0.1.0`) — General-Purpose Multi-Agent AI Intelligence Platform
+> - **Parent Platform:** AURENYX VAELOR (`v0.3`) — General-Purpose Multi-Agent AI Intelligence Workspace
 > - **Integrated Governance Feature Suite:** **AURENYX TRUSTGRID** (created under **AURENYX VÆLOR**) — *“Turn AI innovation into trust.”*
 > - **Native Android Application:** `org.aethervanguard.aurenyxvaelor` (Kotlin + Jetpack Compose, API 26–35)
 > - **Founder Organization:** The Aether Vanguard
@@ -17,10 +17,11 @@
 
 This repository delivers three cohesive, security-hardened layers inside one unified workspace:
 
-### A. AURENYX VAELOR Core Assistant (`/`, `/overview`, `/research`, `/agents`, `/knowledge`, `/projects`, `/tasks`, `/settings`)
-- **Multi-Agent Orchestrator (`src/server/orchestrator.ts`)**: Routes prompts across **Aurenyx Research**, **Vaelor Forge**, **Vaelor Knowledge**, **Vaelor Sentinel**, and **Vaelor Core** with a bounded 4-step ceiling.
-- **Stage A–D Permissioned Tool Gateway (`src/server/tools.ts`)**: Zero-`eval` calculator, CSV analyzer, JSON validator, deterministic SVG chart builder, document chunk retrieval with passage citations, and honest `requires_config` gating for unconfigured external connectors.
-- **Server-Side Security (`server.ts`, `src/server/validation.ts`)**: Strict Zod schemas, sliding-window rate limiting, secret-leak blocking, prompt-injection screening, and sanitized JSON error responses.
+### A. AURENYX VAELOR v0.3 Autonomous Workspace (`/`, `/overview`, `/research`, `/agents`, `/knowledge`, `/projects`, `/tasks`, `/settings`)
+- **Bounded Multi-Agent Orchestrator (`src/server/orchestrator.ts`)**: Routes prompts across **Vaelor Core**, **Vaelor Research**, **Vaelor Forge**, **Vaelor Analyst**, **Vaelor Knowledge**, and **Vaelor Sentinel** with stage-loop prevention, a bounded 4-step ceiling, explicit `DRAFT → PLAN → APPROVAL_REQUIRED → EXECUTE_TOOLS → VERIFY` workflow plans, and actionable failure recovery guidance.
+- **Stage A–D Permissioned 14-Tool Gateway (`src/server/tools.ts`)**: Zero-`eval` calculator, non-executing static code security reviewer (`code_static_reviewer`), CSV analyzer, JSON validator, deterministic SVG chart builder, document chunk retrieval with passage citations, 12,000-char output bounds, and explicit user-confirmation gating for Stage D connectors.
+- **Project Workspaces & Safe Markdown (`src/views/ProjectsView.tsx`, `src/shared/markdownSafety.ts`)**: Reusable project context briefs, concise task plans, user-approved chat summaries, portable JSON workspace export, and strict URL scheme neutralization blocking `javascript:` / `data:` XSS links.
+- **Server-Side Security & Budget Guardrails (`server.ts`, `src/server/modelGateway.ts`)**: Strict Zod schemas, per-IP+session sliding-window rate limiting, bounded concurrency (`VAELOR_MAX_CONCURRENCY`), private-session-only cache scoping, paid-model blocking unless `ENABLE_PAID_MODELS=true`, and sanitized JSON error responses.
 
 ### B. AURENYX TRUSTGRID — AI Workflow Governance Suite (Integrated Inside App Features)
 Accessible directly from the app sidebar and across dedicated routes:

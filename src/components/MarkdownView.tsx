@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import katex from 'katex';
 import { Check, Copy, Download } from 'lucide-react';
+import { parseSafeMarkdownLink } from '../shared/markdownSafety';
 
 interface MarkdownViewProps {
   content: string;
@@ -223,7 +224,7 @@ const CodeBlock: React.FC<{ lang: string; code: string }> = ({ lang, code }) => 
 
 function renderInlineFormatting(line: string): React.ReactNode[] {
   const inlinePattern =
-    /(`[^`]+`|\[[^\]]+\]\(https?:\/\/[^\s)]+\)|\\\([^\n]+?\\\)|\$(?!\s)(?:[A-Za-z\\{(]|[^$\n]{1,120}?[\\^_=+\-*/{}])[^$\n]{0,120}?(?<!\s)\$|\*\*[^*]+\*\*|(?<!\*)\*(?!\s|\*)[^*\n]+?(?<!\s|\*)\*(?!\*))/g;
+    /(`[^`]+`|\[[^\]]+\]\((?:[^()\n]|\([^()\n]*\))+\)|\\\([^\n]+?\\\)|\$(?!\s)(?:[A-Za-z\\{(]|[^$\n]{1,120}?[\\^_=+\-*/{}])[^$\n]{0,120}?(?<!\s)\$|\*\*[^*]+\*\*|(?<!\*)\*(?!\s|\*)[^*\n]+?(?<!\s|\*)\*(?!\*))/g;
   const tokens = line.split(inlinePattern);
   return tokens.map((token, idx) => {
     if (!token) return null;
@@ -237,19 +238,32 @@ function renderInlineFormatting(line: string): React.ReactNode[] {
         </code>
       );
     }
-    const linkMatch = token.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/);
-    if (linkMatch) {
-      return (
-        <a
-          key={idx}
-          href={linkMatch[2]}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="text-[#bca8fc] underline underline-offset-2 hover:text-white break-all"
-        >
-          {linkMatch[1]}
-        </a>
-      );
+    if (token.startsWith('[') && token.endsWith(')') && token.includes('](')) {
+      const parsedLink = parseSafeMarkdownLink(token);
+      if (parsedLink) {
+        if (parsedLink.href) {
+          return (
+            <a
+              key={idx}
+              href={parsedLink.href}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-[#bca8fc] underline underline-offset-2 hover:text-white break-all"
+            >
+              {parsedLink.label}
+            </a>
+          );
+        }
+        return (
+          <span
+            key={idx}
+            className="text-[#9e97b0]"
+            title={`Blocked unsafe link scheme (${parsedLink.blockedScheme || 'unsafe'})`}
+          >
+            [{parsedLink.label}] (unsafe link blocked)
+          </span>
+        );
+      }
     }
     if (
       (token.startsWith('\\(') && token.endsWith('\\)')) ||

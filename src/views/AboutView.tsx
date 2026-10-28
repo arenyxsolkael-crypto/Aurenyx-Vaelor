@@ -33,44 +33,44 @@ const TRUSTGRID_PRINCIPLES = [
 
 const CAPABILITY_AUDIT = [
   {
-    item: '01. Universal Chat Engine v1.0 & Multi-Agent Orchestration (v0.2)',
+    item: '01. Autonomous Intelligence Workspace & Multi-Agent Orchestrator (v0.3)',
     status: 'Implemented',
-    notes: '6 roles (Core, Research, Forge, Analyst, Knowledge, Sentinel), schema-validated planner, KaTeX math, Tone/Length controls, and Local Mock Mode.',
+    notes: '6 structured role profiles (Core, Vaelor Research, Forge, Analyst, Knowledge, Sentinel), loop-guarded DRAFT → VERIFY lifecycle, approval-gated workflows, and Local Mock Mode.',
   },
   {
-    item: '02. Aurenyx TrustGrid Governance & Passport Suite',
+    item: '02. Permissioned 14-Tool Gateway & Non-Executing Static Code Reviewer',
+    status: 'Implemented',
+    notes: '14 Zod-validated tools including code_static_reviewer, safe math, CSV stats, SVG charts, and 12k-char output caps; zero shell or arbitrary code execution.',
+  },
+  {
+    item: '03. Project Workspaces, Approved Summaries & JSON Export',
+    status: 'Implemented',
+    notes: 'Reusable project briefs, concise task plans, explicit user-saved chat summaries, and portable JSON workspace bundles.',
+  },
+  {
+    item: '04. Aurenyx TrustGrid Governance & Passport Suite',
     status: 'Implemented',
     notes: '15-question assessment, deterministic provisional risk rules, 8+ test scenarios, 12 safeguard categories, TXT/JSON/Print Passport exports.',
   },
   {
-    item: '03. Native Android App (Kotlin + Jetpack Compose)',
+    item: '05. Native Android App (Kotlin + Jetpack Compose)',
     status: 'Implemented',
     notes: 'Complete Android Studio / Gradle project in /android with private internal history deletion, TLS config, and Play Internal Testing guide.',
   },
   {
-    item: '04. Grounded Web Search Connector',
+    item: '06. Grounded Web Search & Document Passage Retrieval',
     status: 'Implemented',
-    notes: 'Server-side Gemini Google Search Grounding extracts real web URLs/titles; degrades honestly with zero fabricated citations when quota-limited or offline.',
+    notes: 'Server-side Gemini Google Search Grounding + passage-indexed citations; degrades honestly with explicit Research Status labels and zero fabricated URLs.',
   },
   {
-    item: '05. Document Summarization & Grounding',
-    status: 'Implemented',
-    notes: 'Passage-indexed retrieval with supporting citations via Vaelor Knowledge.',
-  },
-  {
-    item: '06. PDF & Text-File Processing',
+    item: '07. PDF & Text-File Processing',
     status: 'Partial (Text Scope)',
     notes: '.txt, .md, .csv, .json, and pasted PDF text active; scanned binary PDF OCR excluded on ₹0 tier.',
   },
   {
-    item: '07. Studio Raster Image Generation',
-    status: 'Requires Paid Key',
-    notes: 'Disabled by ₹0 Free-Tier Guardrail; provides zero-cost SVG Frame Blueprint fallback.',
-  },
-  {
-    item: '08. Multi-User Cloud Governance Database & Email Relay',
-    status: 'Local Fallback Active',
-    notes: 'TrustGrid uses versioned browser localStorage + JSON backup import/export; Contact uses local draft + mailto fallback.',
+    item: '08. Studio Raster Image Generation & Cloud Database Sync',
+    status: '₹0 Guardrail / Local Fallback',
+    notes: 'Paid models blocked unless ENABLE_PAID_MODELS=true; SVG Frame Blueprint fallback + local JSON export active.',
   },
 ];
 
@@ -93,8 +93,11 @@ export const AboutView: React.FC = () => {
                 {OFFICIAL_ATTRIBUTION.productName} &amp; {TRUSTGRID_BRAND.productName}
               </h1>
               <p className="text-xs text-[#a58ff8]">
-                Version {OFFICIAL_ATTRIBUTION.version} · {OFFICIAL_ATTRIBUTION.tagline} ·{' '}
-                {TRUSTGRID_BRAND.tagline}
+                Version {OFFICIAL_ATTRIBUTION.version} ({OFFICIAL_ATTRIBUTION.releaseTitle}) ·{' '}
+                {OFFICIAL_ATTRIBUTION.tagline} · {TRUSTGRID_BRAND.tagline}
+              </p>
+              <p className="mt-0.5 text-xs text-[#b5add0]">
+                {OFFICIAL_ATTRIBUTION.secondaryBrandLine}
               </p>
             </div>
           </div>

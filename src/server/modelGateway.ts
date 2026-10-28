@@ -145,6 +145,36 @@ const DEFAULT_TIMEOUT_MS = 22_000;
 const DEFAULT_MAX_OUTPUT_CHARS = 14_000;
 const MAX_CACHE_ENTRIES = 32;
 
+export const PAID_ONLY_MODEL_IDS = new Set([
+  'gemini-4-argon',
+  'gemini-3-pro-image',
+  'gemini-nano-banana-2.1',
+  'gemini-3.1-flash-lite-image',
+  'gemini-omni-1.1-flash',
+  'lyria-3-clip-preview',
+  'lyria-3-pro-preview',
+]);
+
+/**
+ * Strips conversational filler, untrusted tags, and excess length so search grounding
+ * receives a focused, high-signal query bounded to <=180 characters.
+ */
+export function buildFocusedSearchQuery(rawQuery: string): string {
+  const withoutTags = rawQuery
+    .replace(/<\/?untrusted_data[^>]*>/gi, ' ')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const strippedLeadIn = withoutTags.replace(
+    /^(?:can\s+you\s+|could\s+you\s+|please\s+|hey\s+vaelor[,:]?\s*)*(?:search\s+(?:the\s+web\s+)?(?:for|about)|look\s+up|find\s+recent\s+information\s+on|research\s+and\s+summarize|tell\s+me\s+about)\s+/i,
+    ''
+  );
+
+  const candidate = (strippedLeadIn.trim() || withoutTags).slice(0, 180).trim();
+  return candidate;
+}
+
 function buildContentsWithAttachments(
   turns: GatewayTurn[],
   attachments?: ChatAttachment[]
@@ -239,9 +269,45 @@ export function buildExplicitLocalMockText(turns: GatewayTurn[]): string {
 export class GeminiModelGateway implements ModelGateway {
   private readonly envSource: Record<string, string | undefined>;
   private readonly responseCache = new Map<string, { text: string; modelUsed: string; expiresAt: number }>();
+  private activeRequests = 0;
 
   constructor(envSource: Record<string, string | undefined> = process.env) {
     this.envSource = envSource;
+  }
+
+  public getMaxConcurrency(): number {
+    const raw = Number(this.envSource.VAELOR_MAX_CONCURRENCY ?? 4);
+    if (!Number.isFinite(raw)) return 4;
+    return Math.max(1, Math.min(16, Math.floor(raw)));
+  }
+
+  private assertModelAllowedUnderBudget(modelId: string, paidModelsEnabled: boolean): void {
+    const normalized = modelId.trim().toLowerCase();
+    if (!paidModelsEnabled && PAID_ONLY_MODEL_IDS.has(normalized)) {
+      throw new ModelGatewayError({
+        code: 'PAID_TIER_REQUIRED',
+        message: `₹0 Free-Tier Guardrail Active: Model '${modelId}' requires paid billing and cannot be invoked unless ENABLE_PAID_MODELS=true is explicitly approved.`,
+        statusCode: 403,
+        retryable: false,
+      });
+    }
+  }
+
+  private acquireConcurrencySlot(): void {
+    const limit = this.getMaxConcurrency();
+    if (this.activeRequests >= limit) {
+      throw new ModelGatewayError({
+        code: 'QUOTA_EXCEEDED',
+        message: `Server concurrency ceiling (${limit} active model requests) reached to protect free-tier stability. Please retry in a moment.`,
+        statusCode: 429,
+        retryable: true,
+      });
+    }
+    this.activeRequests += 1;
+  }
+
+  private releaseConcurrencySlot(): void {
+    this.activeRequests = Math.max(0, this.activeRequests - 1);
   }
 
   private getApiKey(): string | undefined {
@@ -400,9 +466,11 @@ export class GeminiModelGateway implements ModelGateway {
     const ai = this.createClient();
     const status = this.getStatus();
     const targetModel = input.tier === 'fast' ? status.fastModel : status.primaryModel;
+    this.assertModelAllowedUnderBudget(targetModel, status.paidModelsEnabled);
     const maxChars = input.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS;
     const contents = buildContentsWithAttachments(input.messages, input.attachments);
 
+    this.acquireConcurrencySlot();
     try {
       const responseStream = await withRetryAndTimeout(
         () =>
@@ -439,6 +507,8 @@ export class GeminiModelGateway implements ModelGateway {
       }
     } catch (error) {
       throw normalizeProviderError(error);
+    } finally {
+      this.releaseConcurrencySlot();
     }
   }
 
@@ -456,13 +526,21 @@ export class GeminiModelGateway implements ModelGateway {
     const ai = this.createClient();
     const status = this.getStatus();
     const requestedModel = req.tier === 'fast' ? status.fastModel : status.primaryModel;
+    this.assertModelAllowedUnderBudget(requestedModel, status.paidModelsEnabled);
     const timeoutMs = req.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const maxChars = req.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS;
+
+    const isPrivateSessionScope =
+      Boolean(req.cacheScope) &&
+      req.cacheScope!.length >= 8 &&
+      req.cacheScope !== 'anon' &&
+      req.cacheScope !== 'public' &&
+      req.cacheScope !== 'default-session';
 
     const canCache =
       !req.bypassCache &&
       (!req.attachments || req.attachments.length === 0) &&
-      Boolean(req.cacheScope);
+      isPrivateSessionScope;
     const cacheKey = canCache
       ? this.computeCacheKey(req.cacheScope!, requestedModel, req.systemInstruction, req.turns)
       : '';
@@ -481,39 +559,45 @@ export class GeminiModelGateway implements ModelGateway {
     const contents = buildContentsWithAttachments(req.turns, req.attachments);
 
     const invokeModel = async (targetModel: string, callTimeoutMs: number) => {
-      const response = await withRetryAndTimeout(
-        () =>
-          ai.models.generateContent({
-            model: targetModel,
-            contents,
-            config: {
-              systemInstruction: req.systemInstruction,
-              temperature: 0.4,
-            },
-          }),
-        callTimeoutMs,
-        req.signal
-      );
+      this.assertModelAllowedUnderBudget(targetModel, status.paidModelsEnabled);
+      this.acquireConcurrencySlot();
+      try {
+        const response = await withRetryAndTimeout(
+          () =>
+            ai.models.generateContent({
+              model: targetModel,
+              contents,
+              config: {
+                systemInstruction: req.systemInstruction,
+                temperature: 0.4,
+              },
+            }),
+          callTimeoutMs,
+          req.signal
+        );
 
-      const rawText = response.text?.trim() ?? '';
-      if (!rawText) {
-        throw new ModelGatewayError({
-          code: 'INVALID_OUTPUT',
-          message: 'The model returned an empty response. Please retry your request.',
-          statusCode: 502,
-          retryable: true,
-        });
+        const rawText = response.text?.trim() ?? '';
+        if (!rawText) {
+          throw new ModelGatewayError({
+            code: 'INVALID_OUTPUT',
+            message: 'The model returned an empty response. Please retry your request.',
+            statusCode: 502,
+            retryable: true,
+          });
+        }
+
+        const boundedText =
+          rawText.length > maxChars
+            ? `${rawText.slice(0, maxChars)}\n\n*[Output truncated at safe ${maxChars.toLocaleString()}-character boundary]*`
+            : rawText;
+
+        return {
+          text: boundedText,
+          modelUsed: targetModel,
+        };
+      } finally {
+        this.releaseConcurrencySlot();
       }
-
-      const boundedText =
-        rawText.length > maxChars
-          ? `${rawText.slice(0, maxChars)}\n\n*[Output truncated at safe ${maxChars.toLocaleString()}-character boundary]*`
-          : rawText;
-
-      return {
-        text: boundedText,
-        modelUsed: targetModel,
-      };
     };
 
     try {
@@ -556,26 +640,31 @@ export class GeminiModelGateway implements ModelGateway {
     options?: { timeoutMs?: number; signal?: AbortSignal }
   ): Promise<GroundedWebSearchResult> {
     throwIfAborted(options?.signal);
+    const focusedQuery = buildFocusedSearchQuery(query);
     const apiKey = this.getApiKey();
-    if (!apiKey) {
+    if (!apiKey || !focusedQuery) {
       return {
         status: 'unavailable',
-        query,
+        query: focusedQuery || query,
         summaryText: '',
         citations: [],
-        note: 'Grounded web search is unavailable because GEMINI_API_KEY is not configured on the server.',
+        note: !apiKey
+          ? 'Grounded web search is unavailable because GEMINI_API_KEY is not configured on the server.'
+          : 'Search query was empty after sanitization.',
       };
     }
 
     const ai = this.createClient();
     const status = this.getStatus();
+    this.assertModelAllowedUnderBudget(status.primaryModel, status.paidModelsEnabled);
     const timeoutMs = options?.timeoutMs ?? 12_000;
 
+    this.acquireConcurrencySlot();
     try {
       const response = await withGatewayTimeout(
         ai.models.generateContent({
           model: status.primaryModel,
-          contents: `Retrieve factual, up-to-date grounded information for the following research query and summarize key verifiable facts concisely:\n\n${query}`,
+          contents: `Retrieve factual, up-to-date grounded information for the following research query and summarize key verifiable facts concisely:\n\n${focusedQuery}`,
           config: {
             tools: [{ googleSearch: {} }],
             temperature: 0.1,
@@ -586,23 +675,45 @@ export class GeminiModelGateway implements ModelGateway {
       );
 
       const summaryText = (response.text ?? '').trim();
-      const rawChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
+      const groundingMeta = response.candidates?.[0]?.groundingMetadata;
+      const rawChunks = groundingMeta?.groundingChunks ?? [];
+      const supports = groundingMeta?.groundingSupports ?? [];
       const seenUrls = new Set<string>();
       const citations: CitationItem[] = [];
+      const retrievedAt = new Date().toISOString();
 
       for (let i = 0; i < rawChunks.length; i += 1) {
         const web = rawChunks[i]?.web;
         const uri = web?.uri?.trim();
         if (!uri || !/^https?:\/\//i.test(uri) || seenUrls.has(uri)) continue;
         seenUrls.add(uri);
+
+        let hostname = uri;
+        try {
+          hostname = new URL(uri).hostname;
+        } catch {
+          // Keep raw URI fallback
+        }
+
+        const matchedSnippets = supports
+          .filter((s) => Array.isArray(s.groundingChunkIndices) && s.groundingChunkIndices.includes(i))
+          .map((s) => s.segment?.text?.trim() ?? '')
+          .filter(Boolean);
+        const snippetText =
+          matchedSnippets.length > 0
+            ? matchedSnippets.join(' · ').slice(0, 240)
+            : summaryText
+              ? `${summaryText.slice(0, 200)}${summaryText.length > 200 ? '…' : ''}`
+              : uri;
+
         citations.push({
-          id: `cit-web-${i + 1}`,
-          sourceTitle: web?.title?.trim() || new URL(uri).hostname,
+          id: `cit-web-${citations.length + 1}`,
+          sourceTitle: web?.title?.trim() || hostname,
           sourceType: 'web',
           url: uri,
-          excerpt: summaryText
-            ? `${summaryText.slice(0, 200)}${summaryText.length > 200 ? '…' : ''} (${uri})`
-            : uri,
+          domain: hostname,
+          retrievedAt,
+          excerpt: snippetText,
         });
         if (citations.length >= 6) break;
       }
@@ -610,7 +721,7 @@ export class GeminiModelGateway implements ModelGateway {
       if (citations.length === 0) {
         return {
           status: 'no_sources',
-          query,
+          query: focusedQuery,
           summaryText,
           citations: [],
           note: 'Search grounding completed, but no verifiable external web source URLs were returned for this query.',
@@ -619,21 +730,25 @@ export class GeminiModelGateway implements ModelGateway {
 
       return {
         status: 'ok',
-        query,
+        query: focusedQuery,
         summaryText,
         citations,
         note: `Retrieved ${citations.length} grounded web source(s) via Gemini Google Search.`,
       };
     } catch (error) {
       const normalized = normalizeProviderError(error);
-      if (normalized.code === 'CANCELLED') throw normalized;
+      if (normalized.code === 'CANCELLED' || normalized.code === 'PAID_TIER_REQUIRED') {
+        throw normalized;
+      }
       return {
         status: 'unavailable',
-        query,
+        query: focusedQuery,
         summaryText: '',
         citations: [],
         note: `Live web search grounding could not be completed (${normalized.code}): ${normalized.message}`,
       };
+    } finally {
+      this.releaseConcurrencySlot();
     }
   }
 
@@ -655,8 +770,10 @@ export class GeminiModelGateway implements ModelGateway {
     const ai = this.createClient();
     const status = this.getStatus();
     const model = status.fastModel || status.primaryModel;
+    this.assertModelAllowedUnderBudget(model, status.paidModelsEnabled);
     const timeoutMs = req.timeoutMs ?? 18_000;
 
+    this.acquireConcurrencySlot();
     try {
       const response = await withRetryAndTimeout(
         () =>
@@ -743,6 +860,8 @@ export class GeminiModelGateway implements ModelGateway {
       };
     } catch (error) {
       throw normalizeProviderError(error);
+    } finally {
+      this.releaseConcurrencySlot();
     }
   }
 

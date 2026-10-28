@@ -103,9 +103,11 @@ export const ToolDirectExecuteSchema = z.object({
     'text_transformer',
     'json_validator',
     'structured_formatter',
+    'code_static_reviewer',
     'task_planner',
     'csv_analyzer',
     'chart_generator',
+    'document_processor',
     'research_framework',
     'web_search_connector',
     'workflow_connector_gate',
@@ -125,7 +127,65 @@ export const ProjectCreateSchema = z.object({
     .trim()
     .min(4, 'Project objective must be at least 4 characters.')
     .max(600, 'Project objective must be under 600 characters.'),
+  description: z.string().trim().max(800).optional(),
+  brief: z.string().trim().max(2400).optional(),
   category: z.enum(['research', 'software', 'strategy', 'documentation']).default('software'),
+});
+
+export const ProjectUpdateSchema = z.object({
+  name: z.string().trim().min(2).max(80).optional(),
+  objective: z.string().trim().min(4).max(600).optional(),
+  description: z.string().trim().max(800).optional(),
+  brief: z.string().trim().max(2400).optional(),
+  category: z.enum(['research', 'software', 'strategy', 'documentation']).optional(),
+  status: z.enum(['active', 'planning', 'paused', 'archived']).optional(),
+  addTaskPlan: z
+    .object({
+      title: z.string().trim().min(2).max(120),
+      steps: z.array(z.string().trim().min(2).max(240)).min(1).max(8),
+      status: z.enum(['planned', 'in_progress', 'completed']).optional().default('planned'),
+    })
+    .optional(),
+  updateTaskPlanStatus: z
+    .object({
+      planId: z.string().trim().min(1).max(80),
+      status: z.enum(['planned', 'in_progress', 'completed']),
+    })
+    .optional(),
+  removeTaskPlanId: z.string().trim().min(1).max(80).optional(),
+  addSummary: z
+    .object({
+      title: z.string().trim().min(2).max(120),
+      summary: z.string().trim().min(4).max(1600),
+      sourceConversationId: z.string().trim().max(120).optional(),
+      approvedByUser: z.boolean().default(true),
+    })
+    .optional(),
+  removeSummaryId: z.string().trim().min(1).max(80).optional(),
+});
+
+export const TaskWorkflowPlanSchema = z.object({
+  title: z
+    .string()
+    .trim()
+    .min(2, 'Task title must be at least 2 characters.')
+    .max(120, 'Task title must be under 120 characters.'),
+  objective: z
+    .string()
+    .trim()
+    .min(4, 'Task objective must be at least 4 characters.')
+    .max(2000, 'Task objective must be under 2,000 characters.'),
+  preferredAgent: AgentIdSchema.optional(),
+  projectId: z.string().trim().max(120).optional(),
+  researchMode: z.boolean().optional().default(false),
+  requiresApproval: z.boolean().optional().default(false),
+  requestedTools: z.array(z.string().trim().max(64)).max(5).optional().default([]),
+});
+
+export const TaskWorkflowExecuteSchema = z.object({
+  confirmedByUser: z.boolean().optional().default(false),
+  mockMode: z.boolean().optional().default(false),
+  useSentinel: z.boolean().optional().default(true),
 });
 
 export const MemoryCreateSchema = z.object({

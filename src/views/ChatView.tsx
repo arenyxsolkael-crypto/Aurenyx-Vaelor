@@ -15,6 +15,7 @@ import {
   ExternalLink,
   FileText,
   FlaskConical,
+  FolderPlus,
   Frame,
   Layers,
   Mic,
@@ -116,11 +117,23 @@ interface BrowserSpeechRecognition {
 const MessageItem: React.FC<{
   message: ChatMessage;
   isSending: boolean;
+  activeProjectName?: string;
   onRetry: (prompt: string) => void;
   onEditUserPrompt: (messageId: string, newContent: string) => void;
   onRegenerate: (assistantMessageId: string) => void;
-}> = ({ message, isSending, onRetry, onEditUserPrompt, onRegenerate }) => {
+  onSaveSummaryToProject?: (message: ChatMessage) => Promise<boolean>;
+}> = ({
+  message,
+  isSending,
+  activeProjectName,
+  onRetry,
+  onEditUserPrompt,
+  onRegenerate,
+  onSaveSummaryToProject,
+}) => {
   const [copied, setCopied] = useState(false);
+  const [savedToProject, setSavedToProject] = useState(false);
+  const [savingToProject, setSavingToProject] = useState(false);
   const [traceExpanded, setTraceExpanded] = useState(false);
   const [toolsExpanded, setToolsExpanded] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
@@ -215,6 +228,12 @@ const MessageItem: React.FC<{
                   <>
                     <span aria-hidden="true">·</span>
                     <span className="text-[#8ad8ff]">Web search grounded</span>
+                  </>
+                )}
+                {run.researchStatusLabel && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <span className="text-[#b8d8f8]">{run.researchStatusLabel}</span>
                   </>
                 )}
                 {completedToolsCount > 0 && (
@@ -459,6 +478,37 @@ const MessageItem: React.FC<{
                 <span>Download .md</span>
               </button>
 
+              {activeProjectName && onSaveSummaryToProject && (
+                <button
+                  type="button"
+                  disabled={savingToProject || savedToProject}
+                  onClick={async () => {
+                    setSavingToProject(true);
+                    const ok = await onSaveSummaryToProject(message);
+                    setSavingToProject(false);
+                    if (ok) {
+                      setSavedToProject(true);
+                      setTimeout(() => setSavedToProject(false), 3000);
+                    }
+                  }}
+                  aria-label={`Save summary to project ${activeProjectName}`}
+                  className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-white/8 bg-[#13111d] px-2.5 py-1 text-xs text-[#b5add0] hover:border-[#8b6ff7]/40 hover:text-white disabled:opacity-65 whitespace-nowrap"
+                >
+                  {savedToProject ? (
+                    <Check className="h-3.5 w-3.5 text-emerald-400" />
+                  ) : (
+                    <FolderPlus className="h-3.5 w-3.5 text-[#a58ff8]" />
+                  )}
+                  <span>
+                    {savedToProject
+                      ? 'Saved to project'
+                      : savingToProject
+                        ? 'Saving…'
+                        : 'Save summary to project'}
+                  </span>
+                </button>
+              )}
+
               {run && (
                 <button
                   type="button"
@@ -496,6 +546,12 @@ const MessageItem: React.FC<{
                 <span>Task ID: {run.taskId}</span>
                 <span>·</span>
                 <span>Type: {run.taskType}</span>
+                {run.lifecycleStage && (
+                  <>
+                    <span>·</span>
+                    <span>Stage: {run.lifecycleStage}</span>
+                  </>
+                )}
                 <span>·</span>
                 <span>Model: {run.modelUsed || 'gemini-3.1-flash-lite'}</span>
                 <span>·</span>
@@ -514,19 +570,45 @@ const MessageItem: React.FC<{
                 </ol>
               </div>
 
+              {run.nextSafeStep && (
+                <p className="text-[#cfc8e2]">
+                  <strong className="font-medium text-[#f1eef9]">Next safe step:</strong>{' '}
+                  {run.nextSafeStep}
+                </p>
+              )}
+
               {run.sentinelReview && (
-                <div className="border-t border-white/8 pt-2">
+                <div className="border-t border-white/8 pt-2 space-y-1.5">
                   <p className="font-medium text-[#e4dff2]">
                     Vaelor Sentinel Verification ({run.sentinelReview.status})
                   </p>
-                  <p className="mt-0.5 text-[#a9a2be]">{run.sentinelReview.summary}</p>
+                  <p className="text-[#a9a2be]">{run.sentinelReview.summary}</p>
                   {run.sentinelReview.flags.length > 0 && (
-                    <ul className="mt-1.5 space-y-1 text-amber-200/90">
+                    <ul className="space-y-1 text-amber-200/90">
                       {run.sentinelReview.flags.map((flag, idx) => (
                         <li key={idx}>• {flag}</li>
                       ))}
                     </ul>
                   )}
+                  {run.sentinelReview.citationChecks &&
+                    run.sentinelReview.citationChecks.length > 0 && (
+                      <div className="pt-1">
+                        <p className="font-medium text-[#d6d0e8]">Citation Checks</p>
+                        <ul className="mt-0.5 space-y-0.5 font-mono text-[11px] text-[#a59ec0]">
+                          {run.sentinelReview.citationChecks.map((cc, cIdx) => (
+                            <li key={cIdx}>
+                              • {cc.url || cc.citationId || 'source'}: {cc.note}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  {run.sentinelReview.verificationLimitations &&
+                    run.sentinelReview.verificationLimitations.length > 0 && (
+                      <p className="text-[11px] text-[#958ea8]">
+                        Limitations: {run.sentinelReview.verificationLimitations.join(' · ')}
+                      </p>
+                    )}
                 </div>
               )}
             </div>
@@ -598,6 +680,7 @@ export const ChatView: React.FC = () => {
     projects,
     activeProjectId,
     setActiveProjectId,
+    updateProject,
   } = useWorkspace();
 
   const [showVisualSpec, setShowVisualSpec] = useState(false);
@@ -619,6 +702,29 @@ export const ChatView: React.FC = () => {
 
   const hasMessages = activeConversation.messages.length > 0;
   const hasStreamingMessage = activeConversation.messages.some((m) => m.isStreaming);
+  const activeProject = projects.find((p) => p.id === activeProjectId);
+
+  const handleSaveSummaryToProject = async (msg: ChatMessage): Promise<boolean> => {
+    if (!activeProject) return false;
+    const summaryTitle =
+      activeConversation.title && activeConversation.title !== 'Untitled session'
+        ? activeConversation.title.slice(0, 110)
+        : `Approved Summary (${new Date(msg.createdAt).toLocaleTimeString([], {
+            hour: '2-digit',
+            minute: '2-digit',
+          })})`;
+    const cleanSummary = msg.content.replace(/\s+/g, ' ').trim().slice(0, 900);
+    if (cleanSummary.length < 4) return false;
+    const res = await updateProject(activeProject.id, {
+      addSummary: {
+        title: summaryTitle,
+        summary: cleanSummary,
+        sourceConversationId: activeConversation.id,
+        approvedByUser: true,
+      },
+    });
+    return res.ok;
+  };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -770,9 +876,15 @@ export const ChatView: React.FC = () => {
             <div className="py-4 sm:py-8">
               <div className="flex flex-col items-start text-left">
                 <VaelorEmblem size="lg" className="mb-5" />
-                <div className="flex flex-wrap items-center gap-2 text-xs text-[#a792fa]">
+                <div className="flex flex-col gap-1 sm:flex-row sm:flex-wrap sm:items-center sm:gap-2 text-xs text-[#a792fa]">
                   <span className="font-medium">{OFFICIAL_ATTRIBUTION.tagline}</span>
-                  <span aria-hidden="true">·</span>
+                  <span aria-hidden="true" className="hidden sm:inline">
+                    ·
+                  </span>
+                  <span className="text-[#cfc8e2]">{OFFICIAL_ATTRIBUTION.secondaryBrandLine}</span>
+                  <span aria-hidden="true" className="hidden sm:inline">
+                    ·
+                  </span>
                   <span className="text-[#958ea8]">
                     By {OFFICIAL_ATTRIBUTION.founderOrganization} · Founded by{' '}
                     {OFFICIAL_ATTRIBUTION.founderName}
@@ -782,9 +894,10 @@ export const ChatView: React.FC = () => {
                   Welcome to AURENYX VAELOR.
                 </h1>
                 <p className="mt-3 max-w-xl text-sm leading-relaxed text-[#a8a1bd] sm:text-base">
-                  An intelligent workspace for research, reasoning, creation, engineering, and
-                  verified synthesis. Tasks are classified, routed to specialized agents, checked
-                  against server-side tool allowlists, and audited by Vaelor Sentinel.
+                  Version {OFFICIAL_ATTRIBUTION.version} ({OFFICIAL_ATTRIBUTION.releaseTitle}) — an
+                  intelligent workspace for research, reasoning, creation, engineering, and verified
+                  synthesis. Tasks are classified, routed to specialist roles, checked against
+                  server-side tool allowlists, and audited by Vaelor Sentinel.
                 </p>
               </div>
 
@@ -888,9 +1001,11 @@ export const ChatView: React.FC = () => {
                     key={msg.id}
                     message={msg}
                     isSending={isSending}
+                    activeProjectName={activeProject?.name}
                     onRetry={(failed) => void retryFailedMessage(failed)}
                     onEditUserPrompt={(id, newText) => void editUserMessage(id, newText)}
                     onRegenerate={(assistantId) => void regenerateResponse(assistantId)}
+                    onSaveSummaryToProject={handleSaveSummaryToProject}
                   />
                 ))}
 
@@ -1087,7 +1202,7 @@ export const ChatView: React.FC = () => {
                   type="button"
                   onClick={() => fileInputRef.current?.click()}
                   aria-label="Attach file or image"
-                  className="inline-flex min-h-[40px] min-w-[40px] items-center justify-center rounded-lg border border-white/10 bg-[#0e0c16] px-2.5 text-xs text-[#b5add0] hover:border-white/20 hover:text-white shrink-0"
+                  className="inline-flex min-h-[44px] min-w-[44px] sm:min-h-[40px] sm:min-w-[40px] items-center justify-center rounded-lg border border-white/10 bg-[#0e0c16] px-2.5 text-xs text-[#b5add0] hover:border-white/20 hover:text-white shrink-0"
                 >
                   <Paperclip className="h-3.5 w-3.5 text-[#a58ff8]" />
                 </button>
@@ -1097,7 +1212,7 @@ export const ChatView: React.FC = () => {
                   onClick={handleToggleVoice}
                   aria-pressed={isListening}
                   aria-label={isListening ? 'Stop voice dictation' : 'Start voice dictation'}
-                  className={`inline-flex min-h-[40px] min-w-[40px] items-center justify-center rounded-lg border px-2.5 text-xs transition-colors shrink-0 ${
+                  className={`inline-flex min-h-[44px] min-w-[44px] sm:min-h-[40px] sm:min-w-[40px] items-center justify-center rounded-lg border px-2.5 text-xs transition-colors shrink-0 ${
                     isListening
                       ? 'border-amber-400/50 bg-amber-950/40 text-amber-200'
                       : 'border-white/10 bg-[#0e0c16] text-[#b5add0] hover:border-white/20'
@@ -1117,10 +1232,10 @@ export const ChatView: React.FC = () => {
                   id="agent-route-select"
                   value={preferredAgent}
                   onChange={(e) => setPreferredAgent(e.target.value as AgentId | 'auto')}
-                  className="min-h-[40px] max-w-[138px] sm:max-w-none rounded-lg border border-white/10 bg-[#0e0c16] px-2 py-1 text-xs text-[#dbd5ec] focus:outline-none focus:border-[#8b6ff7] shrink-0"
+                  className="min-h-[44px] sm:min-h-[40px] max-w-[144px] sm:max-w-none rounded-lg border border-white/10 bg-[#0e0c16] px-2 py-1 text-xs text-[#dbd5ec] focus:outline-none focus:border-[#8b6ff7] shrink-0"
                 >
                   <option value="auto">Auto Orchestrate</option>
-                  <option value="aurenyx-research">Aurenyx Research</option>
+                  <option value="aurenyx-research">Vaelor Research</option>
                   <option value="vaelor-forge">Vaelor Forge</option>
                   <option value="vaelor-analyst">Vaelor Analyst</option>
                   <option value="vaelor-knowledge">Vaelor Knowledge</option>
@@ -1136,7 +1251,7 @@ export const ChatView: React.FC = () => {
                   aria-label="Response tone"
                   value={tone}
                   onChange={(e) => setTone(e.target.value as ResponseTone)}
-                  className="min-h-[40px] rounded-lg border border-white/10 bg-[#0e0c16] px-2 py-1 text-xs text-[#dbd5ec] focus:outline-none focus:border-[#8b6ff7] shrink-0"
+                  className="min-h-[44px] sm:min-h-[40px] rounded-lg border border-white/10 bg-[#0e0c16] px-2 py-1 text-xs text-[#dbd5ec] focus:outline-none focus:border-[#8b6ff7] shrink-0"
                 >
                   <option value="balanced">Tone: Balanced</option>
                   <option value="professional">Tone: Professional</option>
@@ -1153,7 +1268,7 @@ export const ChatView: React.FC = () => {
                   aria-label="Response length"
                   value={responseLength}
                   onChange={(e) => setResponseLength(e.target.value as ResponseLength)}
-                  className="min-h-[40px] rounded-lg border border-white/10 bg-[#0e0c16] px-2 py-1 text-xs text-[#dbd5ec] focus:outline-none focus:border-[#8b6ff7] shrink-0"
+                  className="min-h-[44px] sm:min-h-[40px] rounded-lg border border-white/10 bg-[#0e0c16] px-2 py-1 text-xs text-[#dbd5ec] focus:outline-none focus:border-[#8b6ff7] shrink-0"
                 >
                   <option value="concise">Length: Concise</option>
                   <option value="standard">Length: Standard</option>
@@ -1186,7 +1301,7 @@ export const ChatView: React.FC = () => {
                   onClick={() => setResearchMode((v) => !v)}
                   aria-pressed={researchMode}
                   aria-label="Toggle Research Mode"
-                  className={`inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs transition-colors whitespace-nowrap shrink-0 ${
+                  className={`inline-flex min-h-[44px] min-w-[44px] sm:min-h-[40px] sm:min-w-0 justify-center items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs transition-colors whitespace-nowrap shrink-0 ${
                     researchMode
                       ? 'border-[#8b6ff7]/40 bg-[#1d1731] text-[#dfd7fc]'
                       : 'border-white/10 bg-[#0e0c16] text-[#8f88a3]'
@@ -1201,7 +1316,7 @@ export const ChatView: React.FC = () => {
                   onClick={() => setUseSentinel((v) => !v)}
                   aria-pressed={useSentinel}
                   aria-label="Toggle Sentinel answer verification"
-                  className={`inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs transition-colors whitespace-nowrap shrink-0 ${
+                  className={`inline-flex min-h-[44px] min-w-[44px] sm:min-h-[40px] sm:min-w-0 justify-center items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs transition-colors whitespace-nowrap shrink-0 ${
                     useSentinel
                       ? 'border-[#8b6ff7]/40 bg-[#1d1731] text-[#dfd7fc]'
                       : 'border-white/10 bg-[#0e0c16] text-[#8f88a3]'
@@ -1216,7 +1331,7 @@ export const ChatView: React.FC = () => {
                   onClick={() => setMockMode((v) => !v)}
                   aria-pressed={mockMode}
                   aria-label="Toggle Local Mock Mode"
-                  className={`inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs transition-colors whitespace-nowrap shrink-0 ${
+                  className={`inline-flex min-h-[44px] min-w-[44px] sm:min-h-[40px] sm:min-w-0 justify-center items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs transition-colors whitespace-nowrap shrink-0 ${
                     mockMode
                       ? 'border-amber-400/45 bg-amber-950/35 text-amber-200'
                       : 'border-white/10 bg-[#0e0c16] text-[#8f88a3]'
@@ -1231,7 +1346,7 @@ export const ChatView: React.FC = () => {
                   onClick={() => setShowVisualSpec((v) => !v)}
                   aria-expanded={showVisualSpec}
                   aria-label="Toggle visual frame specification"
-                  className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border border-white/10 bg-[#0e0c16] px-2.5 py-1 text-xs text-[#b5add0] hover:border-white/20 hover:text-white whitespace-nowrap shrink-0"
+                  className="inline-flex min-h-[44px] min-w-[44px] sm:min-h-[40px] sm:min-w-0 justify-center items-center gap-1.5 rounded-lg border border-white/10 bg-[#0e0c16] px-2.5 py-1 text-xs text-[#b5add0] hover:border-white/20 hover:text-white whitespace-nowrap shrink-0"
                 >
                   <Frame className="h-3.5 w-3.5 text-[#a58ff8]" />
                   <span className="hidden sm:inline">Visual Spec</span>

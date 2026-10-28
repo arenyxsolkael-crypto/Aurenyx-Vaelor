@@ -10,8 +10,11 @@ export const OfficialFooter: React.FC = () => {
         <div className="space-y-1.5 text-left">
           <div className="flex items-center gap-2 text-sm font-bold tracking-[0.06em] text-[#f6f4fc]">
             <VaelorEmblem size="sm" />
-            <span>{OFFICIAL_ATTRIBUTION.footerLines[0]}</span>
+            <span>
+              {OFFICIAL_ATTRIBUTION.footerLines[0]} · v{OFFICIAL_ATTRIBUTION.version}
+            </span>
           </div>
+          <p className="text-xs text-[#cfc8e2]">{OFFICIAL_ATTRIBUTION.secondaryBrandLine}</p>
           <p className="text-xs text-[#b5add0]">{OFFICIAL_ATTRIBUTION.footerLines[1]}</p>
           <p className="text-xs text-[#958ea8]">{OFFICIAL_ATTRIBUTION.footerLines[2]}</p>
         </div>

@@ -1,0 +1,289 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 0: Global default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Hardened Global Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function hasValidParentUser(userId) {
+      return exists(/databases/$(database)/documents/users/$(userId)) &&
+        get(/databases/$(database)/documents/users/$(userId)).data.ownerId == request.auth.uid;
+    }
+
+    // Blueprint Validation Helpers (Synced verbatim with firebase-blueprint.json; Auth check first)
+    function isValidUserProfile(data) {
+      return isSignedIn() &&
+        data.ownerId is string &&
+        data.ownerId.size() >= 1 &&
+        data.ownerId.size() <= 128 &&
+        data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.ownerId == request.auth.uid &&
+        data.displayName is string &&
+        data.displayName.size() >= 1 &&
+        data.displayName.size() <= 80 &&
+        data.authProviders is list &&
+        data.authProviders.size() <= 5 &&
+        (data.authProviders.size() == 0 || (data.authProviders[0] is string && data.authProviders[0].size() <= 40)) &&
+        data.themePreference is string &&
+        data.themePreference.size() <= 10 &&
+        (data.themePreference == 'dark' || data.themePreference == 'light') &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidUserPrivateInfo(data) {
+      return isSignedIn() &&
+        data.ownerId is string &&
+        data.ownerId.size() >= 1 &&
+        data.ownerId.size() <= 128 &&
+        data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.ownerId == request.auth.uid &&
+        data.email is string &&
+        data.email.size() >= 3 &&
+        data.email.size() <= 254 &&
+        data.emailVerified is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidCloudProject(data) {
+      return isSignedIn() &&
+        data.ownerId is string &&
+        data.ownerId.size() >= 1 &&
+        data.ownerId.size() <= 128 &&
+        data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.ownerId == request.auth.uid &&
+        data.name is string &&
+        data.name.size() >= 2 &&
+        data.name.size() <= 80 &&
+        data.objective is string &&
+        data.objective.size() >= 4 &&
+        data.objective.size() <= 600 &&
+        data.description is string &&
+        data.description.size() <= 800 &&
+        data.brief is string &&
+        data.brief.size() <= 2400 &&
+        data.category is string &&
+        data.category.size() <= 24 &&
+        (data.category == 'software' || data.category == 'research' || data.category == 'strategy' || data.category == 'documentation') &&
+        data.status is string &&
+        data.status.size() <= 16 &&
+        (data.status == 'active' || data.status == 'planning' || data.status == 'paused' || data.status == 'archived') &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidCloudMemory(data) {
+      return isSignedIn() &&
+        data.ownerId is string &&
+        data.ownerId.size() >= 1 &&
+        data.ownerId.size() <= 128 &&
+        data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.ownerId == request.auth.uid &&
+        data.label is string &&
+        data.label.size() >= 2 &&
+        data.label.size() <= 80 &&
+        data.content is string &&
+        data.content.size() >= 2 &&
+        data.content.size() <= 1200 &&
+        data.category is string &&
+        data.category.size() <= 24 &&
+        (data.category == 'preference' || data.category == 'project-fact' || data.category == 'constraint' || data.category == 'note') &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // 1. Root User Profile (Non-PII; list disabled)
+    match /users/{userId} {
+      allow get: if isOwner(userId) &&
+        isValidId(userId) &&
+        existing().ownerId == request.auth.uid;
+      allow list: if false;
+
+      allow create: if isVerifiedUser() &&
+        isOwner(userId) &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming()) &&
+        incoming().keys().hasAll(['ownerId', 'displayName', 'authProviders', 'themePreference', 'createdAt', 'updatedAt']) &&
+        incoming().keys().hasOnly(['ownerId', 'displayName', 'authProviders', 'themePreference', 'createdAt', 'updatedAt']) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isValidUserProfile(incoming()) &&
+        isVerifiedUser() &&
+        isOwner(userId) &&
+        isValidId(userId) &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'authProviders', 'themePreference', 'updatedAt'])
+        );
+
+      allow delete: if isVerifiedUser() &&
+        isOwner(userId) &&
+        isValidId(userId) &&
+        existing().ownerId == request.auth.uid;
+
+      // 2. Split PII Subcollection (Email isolated strictly to owner; list disabled)
+      match /private/{infoId} {
+        allow get: if isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(infoId) &&
+          infoId == 'account' &&
+          existing().ownerId == request.auth.uid &&
+          hasValidParentUser(userId);
+        allow list: if false;
+
+        allow create: if isVerifiedUser() &&
+          isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(infoId) &&
+          infoId == 'account' &&
+          isValidUserPrivateInfo(incoming()) &&
+          incoming().keys().hasAll(['ownerId', 'email', 'emailVerified', 'createdAt', 'updatedAt']) &&
+          incoming().keys().hasOnly(['ownerId', 'email', 'emailVerified', 'createdAt', 'updatedAt']) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          hasValidParentUser(userId);
+
+        allow update: if isValidUserPrivateInfo(incoming()) &&
+          isVerifiedUser() &&
+          isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(infoId) &&
+          infoId == 'account' &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['email', 'emailVerified', 'updatedAt']) &&
+          hasValidParentUser(userId);
+
+        allow delete: if isVerifiedUser() &&
+          isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(infoId) &&
+          infoId == 'account' &&
+          existing().ownerId == request.auth.uid;
+      }
+
+      // 3. User-Owned Cloud Projects (with Terminal State Locking on 'archived')
+      match /projects/{projectId} {
+        allow get: if isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(projectId) &&
+          existing().ownerId == request.auth.uid &&
+          hasValidParentUser(userId);
+
+        allow list: if isOwner(userId) &&
+          resource.data.ownerId == request.auth.uid;
+
+        allow create: if isVerifiedUser() &&
+          isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(projectId) &&
+          isValidCloudProject(incoming()) &&
+          incoming().keys().hasAll(['ownerId', 'name', 'objective', 'description', 'brief', 'category', 'status', 'createdAt', 'updatedAt']) &&
+          incoming().keys().hasOnly(['ownerId', 'name', 'objective', 'description', 'brief', 'category', 'status', 'createdAt', 'updatedAt']) &&
+          incoming().status != 'archived' &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          hasValidParentUser(userId);
+
+        allow update: if isValidCloudProject(incoming()) &&
+          isVerifiedUser() &&
+          isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(projectId) &&
+          existing().status != 'archived' &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          (
+            (
+              incoming().status != 'archived' &&
+              incoming().diff(existing()).affectedKeys().hasOnly(['name', 'objective', 'description', 'brief', 'category', 'status', 'updatedAt'])
+            ) ||
+            (
+              incoming().status == 'archived' &&
+              incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
+            )
+          ) &&
+          hasValidParentUser(userId);
+
+        allow delete: if isVerifiedUser() &&
+          isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(projectId) &&
+          existing().ownerId == request.auth.uid;
+      }
+
+      // 4. User-Owned Cloud Memories
+      match /memories/{memoryId} {
+        allow get: if isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(memoryId) &&
+          existing().ownerId == request.auth.uid &&
+          hasValidParentUser(userId);
+
+        allow list: if isOwner(userId) &&
+          resource.data.ownerId == request.auth.uid;
+
+        allow create: if isVerifiedUser() &&
+          isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(memoryId) &&
+          isValidCloudMemory(incoming()) &&
+          incoming().keys().hasAll(['ownerId', 'label', 'content', 'category', 'createdAt', 'updatedAt']) &&
+          incoming().keys().hasOnly(['ownerId', 'label', 'content', 'category', 'createdAt', 'updatedAt']) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          hasValidParentUser(userId);
+
+        allow update: if isValidCloudMemory(incoming()) &&
+          isVerifiedUser() &&
+          isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(memoryId) &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['label', 'content', 'category', 'updatedAt']) &&
+          hasValidParentUser(userId);
+
+        allow delete: if isVerifiedUser() &&
+          isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(memoryId) &&
+          existing().ownerId == request.auth.uid;
+      }
+    }
+  }
+}

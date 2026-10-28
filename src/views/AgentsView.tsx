@@ -41,9 +41,10 @@ export const AgentsView: React.FC = () => {
           Specialist Agents & Tool Allowlists
         </h1>
         <p className="max-w-3xl text-sm leading-relaxed text-[#9e97b0]">
-          Vaelor routes requests across five dedicated specialist roles plus Vaelor Core. Each role
-          operates under a strict server-side tool allowlist, schema-validated planner boundaries,
-          and a maximum ceiling of 4 model calls per user request.
+          Vaelor routes requests across five dedicated specialist roles plus Vaelor Core. Each
+          specialist operates as a structured role-prompt and server-side tool-allowlist profile
+          within the single bounded orchestrator—never claiming autonomous background multi-process
+          daemons—under a strict ceiling of 4 model calls per request.
         </p>
       </div>
 
@@ -102,7 +103,7 @@ export const AgentsView: React.FC = () => {
                 <button
                   type="button"
                   onClick={() => launchSpecialist(agent.id, agent.name)}
-                  className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border border-white/12 bg-[#1b162b] px-3 py-1.5 text-xs font-medium text-[#ece8f6] hover:border-[#8b6ff7]/50 hover:bg-[#241d3a] whitespace-nowrap"
+                  className="inline-flex min-h-[44px] items-center gap-1.5 rounded-lg border border-white/12 bg-[#1b162b] px-3 py-1.5 text-xs font-medium text-[#ece8f6] hover:border-[#8b6ff7]/50 hover:bg-[#241d3a] whitespace-nowrap"
                 >
                   <span>Route in Chat</span>
                   <ArrowUpRight className="h-3.5 w-3.5 text-[#a58ff8]" />
@@ -118,13 +119,14 @@ export const AgentsView: React.FC = () => {
         <div className="flex items-center gap-2">
           <Wrench className="h-4 w-4 text-[#a58ff8]" />
           <h2 className="text-base font-semibold text-[#f5f3fc]">
-            Permission-Controlled Tool Registry (v0.2)
+            Permission-Controlled Tool Registry (v0.3 · {tools.length} Tools)
           </h2>
         </div>
         <p className="text-xs text-[#958ea8]">
-          All tool inputs and outputs are validated with server-side Zod schemas, per-task call
-          budgets, and bounded timeouts. Shell execution and arbitrary filesystem access are
-          strictly prohibited.
+          All tool inputs and outputs are validated with server-side Zod schemas, bounded output
+          caps (12,000 chars), per-task call budgets, and timeouts. Shell execution and arbitrary
+          filesystem access are strictly prohibited; <code className="font-mono">code_static_reviewer</code>{' '}
+          inspects code statically without executing untrusted snippets.
         </p>
 
         <div className="overflow-x-auto rounded-2xl border border-white/10 bg-[#13111d]">

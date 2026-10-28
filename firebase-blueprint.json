@@ -1,0 +1,220 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Non-PII account profile and workspace preferences owned by an authenticated Vaelor user.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Immutable Firebase Auth UID of the account owner."
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "description": "Display name shown inside the user's workspace."
+        },
+        "authProviders": {
+          "type": "array",
+          "description": "Bounded list (max 5) of linked Firebase provider IDs (e.g. google.com, password)."
+        },
+        "themePreference": {
+          "type": "string",
+          "enum": ["dark", "light"],
+          "maxLength": 10,
+          "description": "Preferred UI color theme."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Immutable server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "ownerId",
+        "displayName",
+        "authProviders",
+        "themePreference",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "UserPrivateInfo": {
+      "title": "UserPrivateInfo",
+      "description": "Isolated PII record for the user's verified email address and sign-in metadata.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Immutable Firebase Auth UID matching parent userId."
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 254,
+          "description": "Account email address isolated from public profile fields."
+        },
+        "emailVerified": {
+          "type": "boolean",
+          "description": "Whether the user's email was verified according to Firebase Auth."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Immutable server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": ["ownerId", "email", "emailVerified", "createdAt", "updatedAt"]
+    },
+    "CloudProject": {
+      "title": "CloudProject",
+      "description": "User-owned Vaelor project workspace with reusable context brief and terminal archive lock.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Immutable Firebase Auth UID of the project owner."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 80,
+          "description": "Project workspace title."
+        },
+        "objective": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 600,
+          "description": "Primary objective and constraints of the project."
+        },
+        "description": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 800,
+          "description": "Optional summary description."
+        },
+        "brief": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 2400,
+          "description": "Optional reusable context brief injected into Chat."
+        },
+        "category": {
+          "type": "string",
+          "enum": ["software", "research", "strategy", "documentation"],
+          "maxLength": 24,
+          "description": "Primary domain classification."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "planning", "paused", "archived"],
+          "maxLength": 16,
+          "description": "Lifecycle status; 'archived' is a locked terminal state."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Immutable server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "ownerId",
+        "name",
+        "objective",
+        "description",
+        "brief",
+        "category",
+        "status",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "CloudMemory": {
+      "title": "CloudMemory",
+      "description": "Explicitly saved user memory note isolated per authenticated UID.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Immutable Firebase Auth UID of the memory owner."
+        },
+        "label": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 80,
+          "description": "Short label for the saved memory."
+        },
+        "content": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 1200,
+          "description": "User-approved memory note content."
+        },
+        "category": {
+          "type": "string",
+          "enum": ["preference", "project-fact", "constraint", "note"],
+          "maxLength": 24,
+          "description": "Memory classification."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Immutable server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": ["ownerId", "label", "content", "category", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Root user profile document containing non-PII display preferences."
+    },
+    "/users/{userId}/private/{infoId}": {
+      "schema": { "$ref": "#/entities/UserPrivateInfo" },
+      "description": "Split PII subcollection storing the user's verified email address."
+    },
+    "/users/{userId}/projects/{projectId}": {
+      "schema": { "$ref": "#/entities/CloudProject" },
+      "description": "User-owned cloud-persisted project workspaces."
+    },
+    "/users/{userId}/memories/{memoryId}": {
+      "schema": { "$ref": "#/entities/CloudMemory" },
+      "description": "User-owned cloud-persisted memory notes."
+    }
+  }
+}

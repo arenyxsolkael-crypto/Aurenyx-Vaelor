@@ -1,9 +1,10 @@
 import React, { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { ArrowRight, Play, ShieldCheck } from 'lucide-react';
+import { ArrowRight, LogIn, Play, ShieldCheck } from 'lucide-react';
 import { OFFICIAL_ATTRIBUTION } from '../shared/types';
 import { VaelorEmblem } from '../components/VaelorEmblem';
 import { OfficialFooter } from '../components/OfficialFooter';
+import { useAuth } from '../context/AuthContext';
 import { useWorkspace } from '../context/WorkspaceContext';
 
 type DemoTab = 'csv' | 'chart' | 'math';
@@ -22,6 +23,7 @@ const INITIAL_CHART_SERIES = [
 ];
 
 export const OverviewLandingView: React.FC = () => {
+  const { user } = useAuth();
   const { startNewConversation } = useWorkspace();
   const navigate = useNavigate();
 
@@ -91,7 +93,7 @@ export const OverviewLandingView: React.FC = () => {
     if (seedPrompt) {
       startNewConversation(seedPrompt);
     }
-    void navigate('/');
+    void navigate('/chat');
   };
 
   return (
@@ -109,14 +111,19 @@ export const OverviewLandingView: React.FC = () => {
                 </span>
               </div>
 
-              <h1 className="text-[clamp(2.25rem,4vw,3.5rem)] font-bold leading-[1.1] tracking-tight text-[#f6f4fc]">
+              <h1 className="text-[clamp(2.25rem,4vw,3.5rem)] font-bold leading-[1.1] tracking-tight text-[#f6f4fc] [text-wrap:balance]">
                 Intelligence, Orchestrated across Reasoning, Research, and Code.
               </h1>
 
+              <p className="text-sm font-medium text-[#c5b3fc]">
+                {OFFICIAL_ATTRIBUTION.secondaryBrandLine}
+              </p>
+
               <p className="max-w-xl text-base leading-relaxed text-[#a8a1bd]">
-                AURENYX VAELOR routes complex work to specialized AI agents, validates tool calls
-                through strict server-side schemas, analyzes documents and CSV datasets, and reviews
-                answers with Vaelor Sentinel—engineered for an Android-first, ₹0 free-tier workflow.
+                AURENYX VAELOR v0.3 routes complex work across specialized AI role profiles,
+                validates 14 server-side tools including static code inspection, manages reusable
+                project briefs, and audits answers with Vaelor Sentinel—engineered for an
+                Android-first, ₹0 free-tier workflow.
               </p>
             </div>
 
@@ -127,9 +134,19 @@ export const OverviewLandingView: React.FC = () => {
                   onClick={() => handleLaunchWorkspace()}
                   className="inline-flex min-h-[46px] items-center gap-2 rounded-xl bg-[#8b6ff7] px-5 py-2.5 text-sm font-semibold text-[#0b0a10] transition-colors hover:bg-[#9f86fa] whitespace-nowrap"
                 >
-                  <span>Launch Workspace</span>
+                  <span>{user ? 'Open Workspace' : 'Launch Workspace'}</span>
                   <ArrowRight className="h-4 w-4" />
                 </button>
+
+                {!user && (
+                  <Link
+                    to="/auth"
+                    className="inline-flex min-h-[46px] items-center gap-2 rounded-xl border border-white/15 bg-[#19152b] px-4 py-2.5 text-sm font-medium text-[#f5f3fc] hover:border-[#8b6ff7]/50 whitespace-nowrap"
+                  >
+                    <LogIn className="h-4 w-4 text-[#c5b3fc]" />
+                    <span>Sign In / Google</span>
+                  </Link>
+                )}
 
                 <Link
                   to="/about"
@@ -140,8 +157,7 @@ export const OverviewLandingView: React.FC = () => {
               </div>
 
               <p className="text-xs text-[#8f88a3]">
-                Server-isolated Gemini Gateway · Bounded 4-step orchestrator ceiling · Zero client
-                API keys
+                Server-isolated Gemini Gateway · Firebase Auth UID isolation · Zero client API keys
               </p>
             </div>
           </div>
@@ -308,10 +324,10 @@ export const OverviewLandingView: React.FC = () => {
                 01. Multi-Agent Task Orchestration
               </h3>
               <p className="text-sm leading-relaxed text-[#b5add0]">
-                Requests are classified deterministically across Vaelor Core, Aurenyx Research,
-                Vaelor Forge, Vaelor Knowledge, and Vaelor Sentinel. Every task enforces a hard
-                ceiling of 4 model calls per request and exposes its full execution plan and tool
-                latency in real time.
+                Requests are classified deterministically across Vaelor Core, Vaelor Research,
+                Vaelor Forge, Vaelor Analyst, Vaelor Knowledge, and Vaelor Sentinel. Every task
+                enforces loop prevention, a bounded ceiling of 4 model calls per request, and
+                full <code className="font-mono">DRAFT → VERIFY</code> lifecycle visibility.
               </p>
             </article>
 
@@ -378,8 +394,8 @@ export const OverviewLandingView: React.FC = () => {
                 <tr>
                   <td className="px-4 py-3 font-mono font-semibold text-[#f5f3fc]">Stage A</td>
                   <td className="px-4 py-3">
-                    Safe Calculator, Date/Time Utility, Text Transformer, JSON Validator, Document
-                    Passage Search, Task Planner
+                    Safe Calculator, Date/Time Utility, Text Transformer, JSON Validator,
+                    Non-Executing Static Code Reviewer, Document Passage Search, Task Planner
                   </td>
                   <td className="px-4 py-3 text-emerald-300">Active & Verified</td>
                   <td className="px-4 py-3 text-[#9e97b0]">Built-in · Zero external cost</td>

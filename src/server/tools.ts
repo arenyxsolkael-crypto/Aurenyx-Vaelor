@@ -11,7 +11,9 @@ import type {
 } from '../shared/types.ts';
 import { AGENT_DEFINITIONS } from './agents.ts';
 import type { ModelGateway } from './modelGateway.ts';
-import { wrapUntrustedData } from './validation.ts';
+import { detectSecretInText, wrapUntrustedData } from './validation.ts';
+
+export const MAX_TOOL_OUTPUT_CHARS = 12_000;
 
 export interface ToolExecutionContext {
   documents: KnowledgeDocument[];
@@ -432,6 +434,125 @@ export function formatStructuredContent(
   };
 }
 
+export interface StaticCodeFinding {
+  rule: string;
+  severity: 'high' | 'medium' | 'low';
+  line: number;
+  message: string;
+}
+
+export interface StaticCodeReviewReport {
+  language: string;
+  lineCount: number;
+  nonEmptyLineCount: number;
+  functionOrMethodCount: number;
+  executedCode: false;
+  findings: StaticCodeFinding[];
+  summary: string;
+}
+
+/**
+ * Deterministic Static Code Reviewer (VAELOR v0.3 Phase 5).
+ * Inspects source code syntax/patterns statically without ever executing untrusted code.
+ */
+export function analyzeCodeStatically(
+  rawInput: string,
+  languageHint?: string
+): StaticCodeReviewReport {
+  const fenceMatch = rawInput.match(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/);
+  const detectedLang = (languageHint || fenceMatch?.[1] || 'source').trim() || 'source';
+  const code = (fenceMatch?.[2] ?? rawInput).slice(0, 30_000);
+  const lines = code.split(/\r?\n/);
+  const nonEmptyLines = lines.filter((l) => l.trim().length > 0);
+  const findings: StaticCodeFinding[] = [];
+
+  let functionCount = 0;
+
+  lines.forEach((line, idx) => {
+    const lineNum = idx + 1;
+    if (
+      /\bfunction\s+[A-Za-z0-9_]+|\b(?:const|let|var)\s+[A-Za-z0-9_]+\s*=\s*(?:async\s*)?\([^)]*\)\s*=>|\bdef\s+[A-Za-z0-9_]+\s*\(|\bfun\s+[A-Za-z0-9_]+\s*\(/.test(
+        line
+      )
+    ) {
+      functionCount += 1;
+    }
+
+    if (/\beval\s*\(|\bnew\s+Function\s*\(/.test(line)) {
+      findings.push({
+        rule: 'dynamic-code-execution',
+        severity: 'high',
+        line: lineNum,
+        message: 'Avoid eval() or new Function() on untrusted input due to code-injection risk.',
+      });
+    }
+
+    if (detectSecretInText(line)) {
+      findings.push({
+        rule: 'hardcoded-secret-pattern',
+        severity: 'high',
+        line: lineNum,
+        message: 'Potential hardcoded API key or private credential detected; move secrets to server env.',
+      });
+    }
+
+    if (
+      /\b(?:SELECT|INSERT|UPDATE|DELETE)\b[\s\S]{0,80}\$\{/i.test(line) ||
+      /\b(?:SELECT|INSERT|UPDATE|DELETE)\b[^;\n]*\+\s*[A-Za-z0-9_]+/i.test(line)
+    ) {
+      findings.push({
+        rule: 'sql-string-interpolation',
+        severity: 'high',
+        line: lineNum,
+        message: 'Possible raw SQL string concatenation/interpolation; use parameterized queries.',
+      });
+    }
+
+    if (/\bdangerouslySetInnerHTML\b|\.innerHTML\s*=/.test(line)) {
+      findings.push({
+        rule: 'raw-dom-html-sink',
+        severity: 'medium',
+        line: lineNum,
+        message: 'Raw HTML sink detected; ensure untrusted content is escaped or sanitized against XSS.',
+      });
+    }
+
+    if (/\bwindow\.(?:alert|confirm|prompt|open)\s*\(/.test(line)) {
+      findings.push({
+        rule: 'iframe-blocking-dialog',
+        severity: 'low',
+        line: lineNum,
+        message: 'Avoid window.alert/confirm/open in sandboxed iframe environments; use inline UI.',
+      });
+    }
+  });
+
+  if (/catch\s*(?:\([^)]*\))?\s*\{\s*\}/.test(code)) {
+    findings.push({
+      rule: 'silent-empty-catch',
+      severity: 'low',
+      line: 1,
+      message: 'Empty catch block detected; log sanitized context or surface a structured error state.',
+    });
+  }
+
+  const trimmedFindings = findings.slice(0, 20);
+  const summary =
+    trimmedFindings.length === 0
+      ? `Static inspection completed across ${lines.length} line(s): 0 high/medium risk patterns detected (code was NOT executed).`
+      : `Static inspection identified ${trimmedFindings.length} finding(s) across ${lines.length} line(s) (code was NOT executed).`;
+
+  return {
+    language: detectedLang,
+    lineCount: lines.length,
+    nonEmptyLineCount: nonEmptyLines.length,
+    functionOrMethodCount: functionCount,
+    executedCode: false,
+    findings: trimmedFindings,
+    summary,
+  };
+}
+
 export function buildDeterministicSvgChart(params: {
   title: string;
   chartType: 'bar' | 'line';
@@ -546,6 +667,11 @@ const JsonValidatorSchema = z.object({
 const StructuredFormatterSchema = z.object({
   rawInput: z.string().trim().min(1).max(30000),
   targetFormat: z.enum(['markdown_table', 'json']).default('markdown_table'),
+});
+
+const CodeStaticReviewerSchema = z.object({
+  code: z.string().trim().min(1).max(30000),
+  language: z.string().trim().max(40).optional(),
 });
 
 const TaskPlannerSchema = z.object({
@@ -811,6 +937,30 @@ export const TOOL_REGISTRY: Record<ToolName, ToolDefinition<any>> = {
       const res = formatStructuredContent(rawInput, targetFormat);
       return {
         formattedOutput: wrapUntrustedData('structured_formatter', JSON.stringify(res, null, 2)),
+      };
+    },
+  },
+
+  code_static_reviewer: {
+    name: 'code_static_reviewer',
+    stage: 'A',
+    availability: 'available',
+    requiresConfirmation: false,
+    description:
+      'Performs deterministic static security and quality inspection on pasted code without executing it.',
+    inputSchema: CodeStaticReviewerSchema,
+    outputSchema: ToolResultPayloadSchema,
+    outputSchemaSummary:
+      '{ language: string, lineCount: number, executedCode: false, findings: StaticCodeFinding[] }',
+    allowedAgents: ['vaelor-forge', 'vaelor-core'],
+    timeoutMs: 2000,
+    maxCallsPerTask: 2,
+    errorStrategy: 'return_structured_error',
+    resultFormat: 'Static security & code quality report (non-executing)',
+    execute: async ({ code, language }: { code: string; language?: string }) => {
+      const report = analyzeCodeStatically(code, language);
+      return {
+        formattedOutput: wrapUntrustedData('code_static_reviewer', JSON.stringify(report, null, 2)),
       };
     },
   },
@@ -1350,11 +1500,15 @@ export async function executeToolWithPermissions(params: {
     }
 
     const result = validatedOut.data as ToolResultPayload;
+    const boundedOutput =
+      result.formattedOutput.length > MAX_TOOL_OUTPUT_CHARS
+        ? `${result.formattedOutput.slice(0, MAX_TOOL_OUTPUT_CHARS)}\n...[truncated at ${MAX_TOOL_OUTPUT_CHARS.toLocaleString()}-char tool safety limit]`
+        : result.formattedOutput;
     return {
       record: {
         tool: typedName,
         input: parsed.data as Record<string, unknown>,
-        output: result.formattedOutput,
+        output: boundedOutput,
         status: 'completed',
         durationMs: Date.now() - started,
         svgArtifact: result.svgArtifact,

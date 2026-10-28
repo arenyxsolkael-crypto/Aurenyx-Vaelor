@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { isSafeExternalUrl } from '../shared/markdownSafety.ts';
 import type {
   AgentId,
   AIStreamEvent,
@@ -6,9 +7,11 @@ import type {
   CitationItem,
   KnowledgeDocument,
   ProjectWorkspace,
+  ResearchStatus,
   ResponseLength,
   ResponseTone,
   SavedMemory,
+  SentinelCitationCheck,
   SentinelReview,
   SentinelVerificationStatus,
   StructuredTaskRun,
@@ -28,9 +31,10 @@ import { ModelGatewayError, type GatewayTurn, type ModelGateway } from './modelG
 import {
   buildStylePreferenceDirective,
   evaluateContentSafetyPolicy,
-  MAX_TASK_EXECUTION_MS,
-  MAX_TOOL_CALLS_PER_TASK,
   parseAndValidatePlannerOutput,
+  resolveMaxTaskExecutionMs,
+  resolveMaxTaskStages,
+  resolveMaxToolCalls,
 } from './planner.ts';
 import { executeToolWithPermissions, TOOL_REGISTRY } from './tools.ts';
 import {
@@ -71,9 +75,20 @@ export interface OrchestrateResult {
   generatedSvgBlueprint?: string;
 }
 
+export interface DeterministicSentinelAuditResult {
+  flags: string[];
+  issues: string[];
+  unsupportedClaims: string[];
+  citationChecks: SentinelCitationCheck[];
+  requiredCorrections: string[];
+  verificationLimitations: string[];
+  requiresRevision: boolean;
+}
+
 /**
- * Deterministic Sentinel pre-audit and post-audit rules.
- * Ensures security and grounding invariants never depend solely on an LLM critic.
+ * Deterministic Sentinel pre-audit and post-audit rules (VAELOR v0.3 Phase 4).
+ * Ensures security, citation authenticity, URL syntax, and grounding invariants
+ * never depend solely on an LLM critic and never emit fake numeric confidence scores.
  */
 export function runDeterministicSentinelAudit(params: {
   userRequest: string;
@@ -82,9 +97,31 @@ export function runDeterministicSentinelAudit(params: {
   citations: CitationItem[];
   promptInjectionFlagged: boolean;
   webSearchUsed?: boolean;
-}): { flags: string[]; requiresRevision: boolean } {
+  researchMode?: boolean;
+  isMockResponse?: boolean;
+}): DeterministicSentinelAuditResult {
   const flags: string[] = [];
+  const issues: string[] = [];
+  const unsupportedClaims: string[] = [];
+  const citationChecks: SentinelCitationCheck[] = [];
+  const requiredCorrections: string[] = [];
   const lowerDraft = params.draftAnswer.toLowerCase();
+
+  // Check retrieved citation URLs first
+  for (const cit of params.citations) {
+    if (cit.url) {
+      const validSyntax = isSafeExternalUrl(cit.url);
+      citationChecks.push({
+        citationId: cit.id,
+        url: cit.url,
+        validSyntax,
+        matchedRetrievedSource: true,
+        note: validSyntax
+          ? `Verified retrieved ${cit.sourceType} source (${cit.sourceTitle}).`
+          : `Retrieved source URL failed http/https syntax check.`,
+      });
+    }
+  }
 
   // 1. Flag fabricated live web browsing claims when web search did NOT return grounded sources
   if (
@@ -93,13 +130,20 @@ export function runDeterministicSentinelAudit(params: {
       params.draftAnswer
     )
   ) {
-    flags.push('Overclaimed live web browsing without verified grounded search sources.');
+    const msg = 'Overclaimed live web browsing without verified grounded search sources.';
+    flags.push(msg);
+    unsupportedClaims.push(msg);
+    requiredCorrections.push(
+      'Remove claims of live web browsing and state explicitly that external web search was not attached.'
+    );
   }
 
   // 2. Flag invented external HTTP URLs when neither user request nor citations contained that URL
   const urlsInDraft = params.draftAnswer.match(/https?:\/\/[^\s)>\]"']+/gi) ?? [];
+  let flaggedUnverifiedUrl = false;
   for (const url of urlsInDraft) {
     const cleanUrl = url.replace(/[.,;]+$/, '');
+    const validSyntax = isSafeExternalUrl(cleanUrl);
     const inRequest = params.userRequest.includes(cleanUrl);
     const inCitations = params.citations.some(
       (c) =>
@@ -108,21 +152,40 @@ export function runDeterministicSentinelAudit(params: {
         c.excerpt.includes(cleanUrl)
     );
     const isLocalhost = /^https?:\/\/(localhost|127\.0\.0\.1)/i.test(cleanUrl);
-    if (!inRequest && !inCitations && !isLocalhost) {
-      flags.push(
-        `Unverified external URL in draft (${cleanUrl.slice(0, 60)}) without connected source verification.`
+    const matched = inRequest || inCitations || isLocalhost;
+
+    citationChecks.push({
+      url: cleanUrl.slice(0, 140),
+      validSyntax,
+      matchedRetrievedSource: matched,
+      note: matched
+        ? 'URL matched retrieved tool citation or user prompt.'
+        : 'URL was not present in retrieved tool records or user prompt.',
+    });
+
+    if (!matched && !flaggedUnverifiedUrl) {
+      flaggedUnverifiedUrl = true;
+      const msg = `Unverified external URL in draft (${cleanUrl.slice(0, 60)}) without connected source verification.`;
+      flags.push(msg);
+      unsupportedClaims.push(msg);
+      requiredCorrections.push(
+        'Strip unverified external URLs unless returned by web_search_connector or supplied by the user.'
       );
-      break;
     }
   }
 
-  // 3. Flag false claims of server code execution or persistent cloud storage
+  // 3. Flag false claims of server code execution, external emails/shell, or persistent cloud storage
   if (
-    /\b(executed\s+(?:your|this|the)\s+code\s+on\s+the\s+server|saved\s+this\s+permanently\s+to\s+(?:supabase|postgresql|cloud\s+database))\b/i.test(
+    /\b(executed\s+(?:your|this|the)\s+code\s+on\s+the\s+server|saved\s+this\s+permanently\s+to\s+(?:supabase|postgresql|cloud\s+database)|i\s+have\s+sent\s+the\s+email|executed\s+the\s+shell\s+command)\b/i.test(
       params.draftAnswer
     )
   ) {
-    flags.push('Overclaimed code execution or persistent database storage.');
+    const msg = 'Overclaimed code execution, external side-effect action, or persistent database storage.';
+    flags.push(msg);
+    unsupportedClaims.push(msg);
+    requiredCorrections.push(
+      'Clarify that VAELOR inspects code statically and stores session data ephemerally unless external connectors are authorized.'
+    );
   }
 
   // 4. Verify numeric consistency when calculator tool succeeded
@@ -139,7 +202,10 @@ export function runDeterministicSentinelAudit(params: {
           !params.draftAnswer.includes(expectedPlain) &&
           !params.draftAnswer.includes(expectedFormatted)
         ) {
-          flags.push(`Draft omitted verified calculator output (${expectedPlain}).`);
+          const msg = `Draft omitted verified calculator output (${expectedPlain}).`;
+          flags.push(msg);
+          issues.push(msg);
+          requiredCorrections.push(`Include exact verified calculator result (${expectedPlain}).`);
         }
       }
     } catch {
@@ -147,23 +213,142 @@ export function runDeterministicSentinelAudit(params: {
     }
   }
 
-  // 5. Flag accidental secret pattern appearance in output
-  if (detectSecretInText(params.draftAnswer)) {
-    flags.push('Security policy violation: potential credential pattern detected in output.');
+  // 5. Check structured 5-section research layout when Research Mode is active (advisory issue)
+  if (params.researchMode && !params.isMockResponse && params.draftAnswer.length > 80) {
+    const expectedHeadings = ['direct answer', 'key findings', 'evidence', 'uncertainties', 'sources'];
+    const foundCount = expectedHeadings.filter((h) => lowerDraft.includes(h)).length;
+    if (foundCount < 3) {
+      issues.push(
+        'Research synthesis omitted one or more standard sections (Direct Answer, Key Findings, Evidence, Uncertainties, Sources).'
+      );
+    }
   }
 
-  // 6. Note if request triggered prompt-injection guard
+  // 6. Flag accidental secret pattern appearance in output
+  if (detectSecretInText(params.draftAnswer)) {
+    const msg = 'Security policy violation: potential credential pattern detected in output.';
+    flags.push(msg);
+    issues.push(msg);
+    requiredCorrections.push('Redact credential-like strings immediately.');
+  }
+
+  // 7. Note if request triggered prompt-injection guard
   if (
     params.promptInjectionFlagged &&
     lowerDraft.includes('system instruction override accepted')
   ) {
-    flags.push('Security policy violation: draft attempted to comply with prompt injection.');
+    const msg = 'Security policy violation: draft attempted to comply with prompt injection.';
+    flags.push(msg);
+    issues.push(msg);
+    requiredCorrections.push('Refuse instruction-override payload and enforce system rules.');
+  }
+
+  const verificationLimitations: string[] = [
+    'Vaelor Sentinel checks internal consistency, tool output alignment, URL syntax, and source matching; it is a verification aid, not an infallible guarantee of external truth.',
+  ];
+  if (params.researchMode && !params.webSearchUsed) {
+    verificationLimitations.push(
+      'No live external web citations were retrieved in this run; confirm time-sensitive claims against primary sources.'
+    );
   }
 
   return {
     flags,
+    issues: Array.from(new Set([...issues, ...flags])),
+    unsupportedClaims,
+    citationChecks,
+    requiredCorrections,
+    verificationLimitations,
     requiresRevision: flags.length > 0,
   };
+}
+
+export function resolveResearchStatus(params: {
+  isResearchTask: boolean;
+  toolCalls: ToolCallRecord[];
+  citations: CitationItem[];
+  sentinelApproved: boolean;
+  mockMode: boolean;
+}): { researchStatus?: ResearchStatus; researchStatusLabel?: string } {
+  if (!params.isResearchTask) {
+    return {};
+  }
+
+  const searchCall = params.toolCalls.find((t) => t.tool === 'web_search_connector');
+  const hasWebCitations = params.citations.some((c) => c.sourceType === 'web');
+  const hasDocCitations = params.citations.some(
+    (c) => c.sourceType === 'document' || c.sourceType === 'memory'
+  );
+
+  if (!params.sentinelApproved) {
+    return {
+      researchStatus: 'verification_incomplete',
+      researchStatusLabel: 'Verification incomplete',
+    };
+  }
+
+  if (params.mockMode) {
+    return {
+      researchStatus: 'search_unavailable',
+      researchStatusLabel: 'Search unavailable',
+    };
+  }
+
+  if (searchCall) {
+    if (searchCall.status !== 'completed') {
+      return {
+        researchStatus: 'search_unavailable',
+        researchStatusLabel: 'Search unavailable',
+      };
+    }
+    if (
+      searchCall.output.includes('"status": "unavailable"') ||
+      searchCall.output.includes('"status": "requires_config"') ||
+      searchCall.output.includes('"status": "mock_mode"')
+    ) {
+      return {
+        researchStatus: hasDocCitations ? 'partial_results' : 'search_unavailable',
+        researchStatusLabel: hasDocCitations ? 'Partial results' : 'Search unavailable',
+      };
+    }
+    if (searchCall.output.includes('"status": "no_sources"') && !hasWebCitations) {
+      return {
+        researchStatus: 'partial_results',
+        researchStatusLabel: 'Partial results',
+      };
+    }
+  }
+
+  if (hasWebCitations || hasDocCitations) {
+    return {
+      researchStatus: 'research_completed',
+      researchStatusLabel: 'Research completed',
+    };
+  }
+
+  return {
+    researchStatus: 'partial_results',
+    researchStatusLabel: 'Partial results',
+  };
+}
+
+function resolveNextSafeStepForError(code: string): string {
+  switch (code) {
+    case 'MISSING_API_KEY':
+      return 'Add GEMINI_API_KEY in server-side Secrets/.env, or enable Local Mock Mode for ₹0 interface testing.';
+    case 'INVALID_API_KEY':
+      return 'Verify GEMINI_API_KEY and VAELOR_DEFAULT_MODEL in server Secrets and retry.';
+    case 'QUOTA_EXCEEDED':
+      return 'Wait 30–60 seconds for free-tier rate limits or concurrency slots to replenish, then retry.';
+    case 'PAID_TIER_REQUIRED':
+      return 'Keep ENABLE_PAID_MODELS=false for ₹0 mode and switch to the default free-tier model (gemini-3.1-flash-lite) or SVG Blueprint fallback.';
+    case 'TIMEOUT':
+      return 'Retry with a shorter, more focused prompt or fewer requested tools.';
+    case 'CANCELLED':
+      return 'Submit a new prompt or click Retry when ready to resume.';
+    default:
+      return 'Inspect the execution details, simplify the input if needed, and retry safely.';
+  }
 }
 
 function resolveSentinelVerificationBadge(params: {
@@ -194,6 +379,7 @@ function resolveSentinelVerificationBadge(params: {
         (t.tool === 'calculator' ||
           t.tool === 'csv_analyzer' ||
           t.tool === 'json_validator' ||
+          t.tool === 'code_static_reviewer' ||
           t.tool === 'document_processor' ||
           t.tool === 'web_search_connector')
     );
@@ -212,9 +398,128 @@ function resolveSentinelVerificationBadge(params: {
 
 export class VaelorOrchestrator {
   private readonly gateway: ModelGateway;
+  private readonly envSource: Record<string, string | undefined>;
 
-  constructor(gateway: ModelGateway) {
+  constructor(
+    gateway: ModelGateway,
+    envSource: Record<string, string | undefined> = process.env
+  ) {
     this.gateway = gateway;
+    this.envSource = envSource;
+  }
+
+  /**
+   * Creates a structured v0.3 Task Workflow Plan (`DRAFT → PLAN` or `APPROVAL_REQUIRED`)
+   * before invoking model/tool execution so users can inspect or approve Stage D actions.
+   */
+  public createWorkflowPlan(params: {
+    title: string;
+    objective: string;
+    preferredAgent?: AgentId;
+    projectId?: string;
+    researchMode?: boolean;
+    requiresApproval?: boolean;
+    requestedTools?: string[];
+    ownerSessionId?: string;
+    hasDocuments?: boolean;
+    hasMemories?: boolean;
+  }): StructuredTaskRun {
+    const maxSteps = resolveMaxTaskStages(this.envSource);
+    const maxTools = resolveMaxToolCalls(this.envSource);
+    const injectionCheck = assessPromptInjection(params.objective);
+    const classification = classifyTask(params.objective, {
+      preferredAgent: params.preferredAgent,
+      researchMode: params.researchMode,
+      hasDocuments: params.hasDocuments,
+      hasMemories: params.hasMemories,
+    });
+    const agentMeta = AGENT_DEFINITIONS[classification.agentId];
+    const mergedTools = Array.from(
+      new Set(
+        [...(params.requestedTools ?? []), ...classification.suggestedTools].filter(
+          (t): t is ToolName => agentMeta.permittedTools.includes(t as ToolName)
+        )
+      )
+    ).slice(0, maxTools);
+
+    const hasStageDConfirmationTool =
+      mergedTools.some((t) => TOOL_REGISTRY[t]?.requiresConfirmation) ||
+      (params.requestedTools ?? []).includes('workflow_connector_gate');
+    const needsApproval = Boolean(params.requiresApproval) || hasStageDConfirmationTool;
+
+    const validatedPlan = parseAndValidatePlannerOutput(
+      {
+        goal: params.objective.trim().slice(0, 260),
+        detectedCategories: classification.detectedCategories,
+        selectedAgent: agentMeta.id,
+        requiresTools: mergedTools.length > 0,
+        permittedTools: [...agentMeta.permittedTools],
+        selectedTools: mergedTools,
+        isMultiStep: true,
+        requiresExternalEvidence:
+          Boolean(params.researchMode) || classification.taskType === 'research',
+        completionCriteria: `Complete "${params.title}" with verified outputs and Sentinel audit.`,
+        plannerSource: 'deterministic-schema',
+      },
+      {
+        userMessage: params.objective,
+        selectedAgent: agentMeta.id,
+        permittedTools: [...agentMeta.permittedTools],
+        detectedCategories: classification.detectedCategories,
+      }
+    );
+
+    const nowIso = new Date().toISOString();
+    return {
+      taskId: `tsk_${crypto.randomUUID().slice(0, 10)}`,
+      title: params.title.trim(),
+      objective: params.objective.trim(),
+      lifecycleStage: needsApproval ? 'APPROVAL_REQUIRED' : 'PLAN',
+      requiresApproval: needsApproval,
+      approvedByUser: false,
+      completedStages: ['DRAFT', 'PLAN'],
+      limitations: [
+        'Session-ephemeral storage active (₹0 Free Tier); export critical outputs to Markdown or Project JSON.',
+      ],
+      researchStatus:
+        params.researchMode || classification.taskType === 'research'
+          ? 'search_available'
+          : undefined,
+      researchStatusLabel:
+        params.researchMode || classification.taskType === 'research'
+          ? 'Search available'
+          : undefined,
+      taskType: classification.taskType,
+      detectedCategories: validatedPlan.detectedCategories,
+      taskPlan: validatedPlan,
+      userRequest: params.objective.trim(),
+      selectedAgent: agentMeta.id,
+      agentName: agentMeta.name,
+      status: needsApproval ? 'awaiting_approval' : 'planning',
+      permittedTools: [...agentMeta.permittedTools],
+      planSteps: [
+        `Drafted task "${params.title.trim()}"`,
+        `Assigned specialist role: ${agentMeta.name}`,
+        mergedTools.length > 0
+          ? `Planned allowed tools: ${mergedTools.join(', ')}`
+          : 'No external tools required; direct specialist synthesis planned',
+        needsApproval
+          ? 'Awaiting explicit user approval before executing workflow tools'
+          : 'Ready for bounded execution and Sentinel verification',
+      ],
+      stepCount: 0,
+      maxSteps,
+      toolCalls: [],
+      citations: [],
+      promptInjectionFlagged: injectionCheck.flagged,
+      researchMode: Boolean(params.researchMode),
+      webSearchUsed: false,
+      projectId: params.projectId,
+      ownerSessionId: params.ownerSessionId,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      durationMs: 0,
+    };
   }
 
   public async executeTask(req: OrchestrateRequest): Promise<OrchestrateResult> {
@@ -228,10 +533,29 @@ export class VaelorOrchestrator {
       });
     }
 
+    const configuredMaxStages = resolveMaxTaskStages(this.envSource);
+    const maxToolCalls = resolveMaxToolCalls(this.envSource);
+    const maxExecutionMs = resolveMaxTaskExecutionMs(this.envSource);
     const maxSteps = Math.min(
-      MAX_ORCHESTRATOR_MODEL_STEPS,
-      Math.max(1, req.maxStepsOverride ?? MAX_ORCHESTRATOR_MODEL_STEPS)
+      configuredMaxStages,
+      Math.max(1, req.maxStepsOverride ?? configuredMaxStages)
     );
+    const visitedStages = new Set<string>();
+    const completedStages: string[] = ['DRAFT'];
+    let currentStageName = 'PLAN';
+
+    const enterStageOnce = (stageName: string) => {
+      if (visitedStages.has(stageName)) {
+        throw new ModelGatewayError({
+          code: 'PROVIDER_ERROR',
+          message: `Loop prevention halted repeated orchestrator stage '${stageName}'.`,
+          statusCode: 422,
+          retryable: false,
+        });
+      }
+      visitedStages.add(stageName);
+      currentStageName = stageName;
+    };
 
     const attachments = req.attachments ?? [];
     const textAttachments = attachments.filter((a) => a.kind === 'text' && Boolean(a.textContent));
@@ -353,13 +677,14 @@ export class VaelorOrchestrator {
         rawRequestedTools.push('json_validator');
       }
     }
+    enterStageOnce('PLAN');
     const candidateSelectedTools = Array.from(
       new Set(
         rawRequestedTools.filter((t): t is ToolName =>
           agentMeta.permittedTools.includes(t as ToolName)
         )
       )
-    ).slice(0, MAX_TOOL_CALLS_PER_TASK);
+    ).slice(0, maxToolCalls);
 
     const defaultCandidatePlan = {
       goal:
@@ -407,8 +732,12 @@ export class VaelorOrchestrator {
       stage: `Routed to ${agentMeta.name} · checking tools…`,
     });
 
+    completedStages.push('PLAN');
+
     const taskRun: StructuredTaskRun = {
       taskId: `tsk_${crypto.randomUUID().slice(0, 10)}`,
+      lifecycleStage: 'PLAN',
+      completedStages,
       taskType: classification.taskType,
       detectedCategories: validatedPlan.detectedCategories,
       taskPlan: validatedPlan,
@@ -437,6 +766,7 @@ export class VaelorOrchestrator {
       conversationId: req.conversationId,
       ownerSessionId: req.ownerSessionId,
       createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
       durationMs: 0,
     };
 
@@ -449,10 +779,10 @@ export class VaelorOrchestrator {
           retryable: false,
         });
       }
-      if (Date.now() - startedAt > MAX_TASK_EXECUTION_MS) {
+      if (Date.now() - startedAt > maxExecutionMs) {
         throw new ModelGatewayError({
           code: 'TIMEOUT',
-          message: `Task exceeded the ${Math.round(MAX_TASK_EXECUTION_MS / 1000)}s execution safety budget.`,
+          message: `Task exceeded the ${Math.round(maxExecutionMs / 1000)}s execution safety budget.`,
           statusCode: 504,
           retryable: true,
         });
@@ -476,6 +806,8 @@ export class VaelorOrchestrator {
       let generatedSvgBlueprint: string | undefined;
 
       // Phase 1: Execute bounded tools unless planner fell back to direct response
+      enterStageOnce('EXECUTE_TOOLS');
+      taskRun.lifecycleStage = 'EXECUTE_TOOLS';
       if (validatedPlan.plannerSource !== 'fallback-direct') {
         // Preserve explicit requestedTools so unauthorized tool calls still get audited & recorded as 'denied'!
         const explicitUnpermitted = (req.requestedTools ?? []).filter(
@@ -484,7 +816,7 @@ export class VaelorOrchestrator {
         const orderedTools = [
           ...validatedPlan.selectedTools,
           ...explicitUnpermitted,
-        ].slice(0, MAX_TOOL_CALLS_PER_TASK + explicitUnpermitted.length);
+        ].slice(0, maxToolCalls + explicitUnpermitted.length);
 
         const perToolCounts = new Map<string, number>();
         let executedAuthorizedCount = 0;
@@ -496,7 +828,7 @@ export class VaelorOrchestrator {
             Boolean(registeredDef) && agentMeta.permittedTools.includes(toolName as ToolName);
 
           if (isPermitted) {
-            if (executedAuthorizedCount >= MAX_TOOL_CALLS_PER_TASK) continue;
+            if (executedAuthorizedCount >= maxToolCalls) continue;
             const usedCount = perToolCounts.get(toolName) ?? 0;
             if (registeredDef && usedCount >= registeredDef.maxCallsPerTask) continue;
             perToolCounts.set(toolName, usedCount + 1);
@@ -530,6 +862,7 @@ export class VaelorOrchestrator {
           }
         }
       }
+      completedStages.push('EXECUTE_TOOLS');
 
       taskRun.webSearchUsed = taskRun.citations.some((c) => c.sourceType === 'web');
 
@@ -545,6 +878,7 @@ export class VaelorOrchestrator {
       }
 
       // Phase 2: Construct specialist prompt with untrusted data isolation
+      enterStageOnce('SPECIALIST_DRAFT');
       taskRun.status = 'executing';
       planSteps.push(`Generate specialist draft via ${agentMeta.name}`);
       req.onStreamEvent?.({
@@ -677,7 +1011,11 @@ export class VaelorOrchestrator {
         finalAnswer = draftResult.text;
       }
 
+      completedStages.push('SPECIALIST_DRAFT');
+
       // Phase 3: Deterministic + Vaelor Sentinel Verification Pass
+      enterStageOnce('VERIFY');
+      taskRun.lifecycleStage = 'VERIFY';
       const deterministicAudit = runDeterministicSentinelAudit({
         userRequest: req.message,
         draftAnswer: finalAnswer,
@@ -685,6 +1023,8 @@ export class VaelorOrchestrator {
         citations: taskRun.citations,
         promptInjectionFlagged: injectionCheck.flagged,
         webSearchUsed: taskRun.webSearchUsed,
+        researchMode: Boolean(req.researchMode) || classification.taskType === 'research',
+        isMockResponse: taskRun.isMockResponse,
       });
 
       const shouldRunSentinelModel =
@@ -732,6 +1072,8 @@ export class VaelorOrchestrator {
             citations: taskRun.citations,
             promptInjectionFlagged: injectionCheck.flagged,
             webSearchUsed: taskRun.webSearchUsed,
+            researchMode: Boolean(req.researchMode) || classification.taskType === 'research',
+            isMockResponse: taskRun.isMockResponse,
           });
           for (const residual of postAudit.flags) {
             if (!mergedFlags.includes(residual)) mergedFlags.push(residual);
@@ -755,6 +1097,11 @@ export class VaelorOrchestrator {
             verificationStatus: badge.verificationStatus,
             verificationLabel: badge.verificationLabel,
             flags: mergedFlags,
+            issues: Array.from(new Set([...postAudit.issues, ...mergedFlags])),
+            unsupportedClaims: postAudit.unsupportedClaims,
+            citationChecks: postAudit.citationChecks,
+            requiredCorrections: postAudit.requiredCorrections,
+            verificationLimitations: postAudit.verificationLimitations,
             summary: sentinelRes.summary,
             revised: wasRevised,
           };
@@ -778,6 +1125,11 @@ export class VaelorOrchestrator {
               ...deterministicAudit.flags,
               'Model-based Sentinel critic timed out or failed; deterministic audit applied.',
             ],
+            issues: deterministicAudit.issues,
+            unsupportedClaims: deterministicAudit.unsupportedClaims,
+            citationChecks: deterministicAudit.citationChecks,
+            requiredCorrections: deterministicAudit.requiredCorrections,
+            verificationLimitations: deterministicAudit.verificationLimitations,
             summary: 'Deterministic verification applied (LLM critic unavailable).',
             revised: false,
           };
@@ -804,6 +1156,11 @@ export class VaelorOrchestrator {
           verificationStatus: badge.verificationStatus,
           verificationLabel: badge.verificationLabel,
           flags: deterministicAudit.flags,
+          issues: deterministicAudit.issues,
+          unsupportedClaims: deterministicAudit.unsupportedClaims,
+          citationChecks: deterministicAudit.citationChecks,
+          requiredCorrections: deterministicAudit.requiredCorrections,
+          verificationLimitations: deterministicAudit.verificationLimitations,
           summary:
             deterministicAudit.flags.length > 0
               ? 'Deterministic Sentinel checks flagged items for user attention.'
@@ -815,14 +1172,33 @@ export class VaelorOrchestrator {
           revised: false,
         };
       }
+      completedStages.push('VERIFY');
 
       if (detectSecretInText(finalAnswer)) {
         finalAnswer =
           'Response withheld by Vaelor Sentinel: output matched a restricted credential pattern.';
       }
 
+      const isResearchTask =
+        Boolean(req.researchMode) || classification.taskType === 'research';
+      const researchMeta = resolveResearchStatus({
+        isResearchTask,
+        toolCalls: taskRun.toolCalls,
+        citations: taskRun.citations,
+        sentinelApproved: Boolean(taskRun.sentinelReview?.approved),
+        mockMode: Boolean(req.mockMode),
+      });
+      if (researchMeta.researchStatus) {
+        taskRun.researchStatus = researchMeta.researchStatus;
+        taskRun.researchStatusLabel = researchMeta.researchStatusLabel;
+      }
+
+      completedStages.push('COMPLETED');
+      taskRun.lifecycleStage = 'COMPLETED';
       taskRun.status = 'completed';
       taskRun.result = finalAnswer;
+      taskRun.limitations = taskRun.sentinelReview?.verificationLimitations;
+      taskRun.updatedAt = new Date().toISOString();
       taskRun.durationMs = Date.now() - startedAt;
 
       return {
@@ -841,12 +1217,16 @@ export class VaelorOrchestrator {
               retryable: true,
             });
 
+      taskRun.lifecycleStage = 'FAILED';
+      taskRun.failedStage = currentStageName;
+      taskRun.nextSafeStep = resolveNextSafeStepForError(normalized.code);
       taskRun.status = 'failed';
       taskRun.error = {
         code: normalized.code,
         message: normalized.message,
         retryable: normalized.retryable,
       };
+      taskRun.updatedAt = new Date().toISOString();
       taskRun.durationMs = Date.now() - startedAt;
       throw Object.assign(normalized, { taskRun });
     }
@@ -921,12 +1301,17 @@ function buildToolArguments(
     return { topic: message.slice(0, 1000) };
   }
   if (toolName === 'structured_formatter') {
-    const targetFormat = /\bjson\b/i.test(message)
-      ? 'json'
-      : /\bbullet|summary\s+list\b/i.test(message)
-        ? 'bullet_summary'
-        : 'markdown_table';
+    const targetFormat = /\bjson\b/i.test(message) ? 'json' : 'markdown_table';
     return { rawInput: message.slice(0, 12000), targetFormat };
+  }
+  if (toolName === 'code_static_reviewer') {
+    const codeAttachment = textAttachments.find((a) =>
+      /\.(ts|tsx|js|jsx|py|kt|sql)$/i.test(a.name)
+    );
+    return {
+      code: (codeAttachment?.textContent ?? message).slice(0, 30000),
+      language: codeAttachment?.name.split('.').pop(),
+    };
   }
   if (toolName === 'web_search_connector') {
     return { query: message.slice(0, 300) };

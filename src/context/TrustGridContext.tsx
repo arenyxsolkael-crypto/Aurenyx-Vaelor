@@ -1,4 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import { useAuth } from './AuthContext';
 import {
   buildPassportSnapshot,
   createEmptyTrustGridState,
@@ -94,33 +95,49 @@ interface TrustGridContextValue {
 
 const TrustGridContext = createContext<TrustGridContextValue | null>(null);
 
-export const TrustGridProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [storageWarning, setStorageWarning] = useState<string | null>(null);
-
-  const [state, setState] = useState<TrustGridStoreState>(() => {
-    try {
-      const raw = window.localStorage.getItem(TRUSTGRID_BRAND.storageKey);
-      if (!raw) {
-        return createSeededTrustGridState();
-      }
-      const parsed = JSON.parse(raw) as unknown;
-      const validated = validateAndParseTrustGridState(parsed);
-      return validated ?? createSeededTrustGridState();
-    } catch {
+function loadTrustGridStateFromStorage(storageKey: string): TrustGridStoreState {
+  try {
+    const raw = window.localStorage.getItem(storageKey);
+    if (!raw) {
       return createSeededTrustGridState();
     }
-  });
+    const parsed = JSON.parse(raw) as unknown;
+    const validated = validateAndParseTrustGridState(parsed);
+    return validated ?? createSeededTrustGridState();
+  } catch {
+    return createSeededTrustGridState();
+  }
+}
+
+export const TrustGridProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const { user } = useAuth();
+  const scopedStorageKey = user?.uid
+    ? `${TRUSTGRID_BRAND.storageKey}_uid_${user.uid}`
+    : `${TRUSTGRID_BRAND.storageKey}_public_demo`;
+
+  const [storageWarning, setStorageWarning] = useState<string | null>(null);
+  const [loadedKey, setLoadedKey] = useState<string>(scopedStorageKey);
+  const [state, setState] = useState<TrustGridStoreState>(() =>
+    loadTrustGridStateFromStorage(scopedStorageKey)
+  );
+
+  // Reload isolated TrustGrid state whenever authenticated account UID changes
+  useEffect(() => {
+    setState(loadTrustGridStateFromStorage(scopedStorageKey));
+    setLoadedKey(scopedStorageKey);
+  }, [scopedStorageKey]);
 
   useEffect(() => {
+    if (loadedKey !== scopedStorageKey) return;
     try {
-      window.localStorage.setItem(TRUSTGRID_BRAND.storageKey, JSON.stringify(state));
+      window.localStorage.setItem(scopedStorageKey, JSON.stringify(state));
       setStorageWarning(null);
     } catch {
       setStorageWarning(
         'Browser local storage is unavailable or full. Changes remain active in memory for this tab; export a JSON backup before closing.'
       );
     }
-  }, [state]);
+  }, [state, scopedStorageKey, loadedKey]);
 
   const saveWorkflowAssessment = useCallback(
     (

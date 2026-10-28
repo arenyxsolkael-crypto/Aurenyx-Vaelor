@@ -1,8 +1,9 @@
 export const OFFICIAL_ATTRIBUTION = {
   productName: 'AURENYX VAELOR',
-  version: '0.2',
-  releaseTitle: 'Universal Chat Engine v1.0 · The Intelligence Expansion',
+  version: '0.3',
+  releaseTitle: 'The Autonomous Intelligence Upgrade',
   tagline: 'Intelligence, Orchestrated.',
+  secondaryBrandLine: 'One Vision. Multiple Intelligences. A New Frontier.',
   category: 'General-Purpose AI Assistant and Intelligent Workflow Platform',
   founderOrganization: 'The Aether Vanguard',
   founderName: 'Arenyx Sol Kael',
@@ -49,10 +50,28 @@ export type SentinelVerificationStatus =
   | 'unverified'
   | 'verification_unavailable';
 
+export type ResearchStatus =
+  | 'search_available'
+  | 'research_completed'
+  | 'partial_results'
+  | 'search_unavailable'
+  | 'verification_incomplete';
+
+export type TaskLifecycleStage =
+  | 'DRAFT'
+  | 'PLAN'
+  | 'APPROVAL_REQUIRED'
+  | 'EXECUTE_TOOLS'
+  | 'VERIFY'
+  | 'COMPLETED'
+  | 'FAILED';
+
 export type ExecutionStatus =
+  | 'draft'
   | 'queued'
   | 'classifying'
   | 'planning'
+  | 'awaiting_approval'
   | 'executing'
   | 'verifying'
   | 'completed'
@@ -69,6 +88,7 @@ export type ToolName =
   | 'text_transformer'
   | 'json_validator'
   | 'structured_formatter'
+  | 'code_static_reviewer'
   | 'task_planner'
   | 'document_processor'
   | 'csv_analyzer'
@@ -128,8 +148,18 @@ export interface CitationItem {
   sourceType: 'document' | 'memory' | 'tool' | 'web';
   excerpt: string;
   url?: string;
+  domain?: string;
+  retrievedAt?: string;
   documentId?: string;
   chunkIndex?: number;
+}
+
+export interface SentinelCitationCheck {
+  citationId?: string;
+  url?: string;
+  validSyntax: boolean;
+  matchedRetrievedSource: boolean;
+  note: string;
 }
 
 export interface SentinelReview {
@@ -138,6 +168,11 @@ export interface SentinelReview {
   verificationStatus?: SentinelVerificationStatus;
   verificationLabel?: string;
   flags: string[];
+  issues?: string[];
+  unsupportedClaims?: string[];
+  citationChecks?: SentinelCitationCheck[];
+  requiredCorrections?: string[];
+  verificationLimitations?: string[];
   summary: string;
   revised: boolean;
 }
@@ -163,6 +198,17 @@ export interface TaskErrorInfo {
 
 export interface StructuredTaskRun {
   taskId: string;
+  title?: string;
+  objective?: string;
+  lifecycleStage?: TaskLifecycleStage;
+  requiresApproval?: boolean;
+  approvedByUser?: boolean;
+  completedStages?: string[];
+  failedStage?: string;
+  nextSafeStep?: string;
+  limitations?: string[];
+  researchStatus?: ResearchStatus;
+  researchStatusLabel?: string;
   taskType: TaskType;
   detectedCategories?: TaskType[];
   taskPlan?: TaskPlanRecord;
@@ -195,6 +241,7 @@ export interface StructuredTaskRun {
   conversationId?: string;
   ownerSessionId?: string;
   createdAt: string;
+  updatedAt?: string;
   durationMs: number;
 }
 
@@ -231,6 +278,7 @@ export interface SavedMemory {
   label: string;
   content: string;
   category: 'preference' | 'project-fact' | 'constraint' | 'note';
+  ownerSessionId?: string;
   createdAt: string;
 }
 
@@ -248,6 +296,24 @@ export interface KnowledgeDocument {
   charCount: number;
   wordCount: number;
   chunks: DocumentChunk[];
+  ownerSessionId?: string;
+  createdAt: string;
+}
+
+export interface ProjectTaskPlanItem {
+  id: string;
+  title: string;
+  steps: string[];
+  status: 'planned' | 'in_progress' | 'completed';
+  createdAt: string;
+}
+
+export interface ProjectSummaryNote {
+  id: string;
+  title: string;
+  summary: string;
+  sourceConversationId?: string;
+  approvedByUser: boolean;
   createdAt: string;
 }
 
@@ -255,9 +321,15 @@ export interface ProjectWorkspace {
   id: string;
   name: string;
   objective: string;
+  description?: string;
+  brief?: string;
   category: 'research' | 'software' | 'strategy' | 'documentation';
-  status: 'active' | 'planning' | 'paused';
+  status: 'active' | 'planning' | 'paused' | 'archived';
+  ownerSessionId?: string;
+  taskPlans?: ProjectTaskPlanItem[];
+  summaries?: ProjectSummaryNote[];
   createdAt: string;
+  updatedAt?: string;
 }
 
 export interface UsageMetadata {
@@ -336,8 +408,12 @@ export interface HealthResponse {
   groundedSearchMode?: 'gemini-google-search' | 'external-search-key' | 'unavailable';
   mockModeDefault?: boolean;
   maxStepsPerRequest: number;
+  maxConcurrentRequests?: number;
   rateLimitPerMinute: number;
-  storageMode: 'in-memory-ephemeral';
+  rateLimitNote?: string;
+  authRequired?: boolean;
+  firebaseProjectId?: string;
+  storageMode: 'in-memory-ephemeral' | 'firestore-plus-session';
   storageNotice: string;
   attribution?: {
     productName: string;
@@ -350,6 +426,40 @@ export interface HealthResponse {
     memories: number;
     documents: number;
     projects: number;
+    tasks: number;
+  };
+}
+
+export interface AuthProviderStatusItem {
+  id: 'google.com' | 'password' | 'emailLink' | 'apple.com' | 'github.com';
+  label: string;
+  status: 'configured' | 'console_enable_required' | 'planned_future';
+  note: string;
+}
+
+export interface AuthConfigResponse {
+  ok: boolean;
+  authRequiredOnProtectedApis: boolean;
+  firebaseConfigured: boolean;
+  projectId: string;
+  authDomain: string;
+  firestoreDatabaseId: string;
+  providers: AuthProviderStatusItem[];
+  recommendedAuthorizedDomains: string[];
+}
+
+export interface AuthenticatedAccountSummary {
+  uid: string;
+  email: string | null;
+  emailVerified: boolean;
+  name: string | null;
+  signInProvider: string;
+  geminiKeyExposedToUser: false;
+  counts: {
+    projects: number;
+    conversations: number;
+    documents: number;
+    memories: number;
     tasks: number;
   };
 }

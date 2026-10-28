@@ -12,6 +12,26 @@ export const MAX_PLANNING_ITERATIONS = 2;
 export const MAX_TOOL_CALLS_PER_TASK = 3;
 export const MAX_TASK_EXECUTION_MS = 35_000;
 
+export function resolveMaxTaskStages(env: Record<string, string | undefined> = process.env): number {
+  const n = Number(env.VAELOR_MAX_STAGES ?? 4);
+  if (!Number.isFinite(n)) return 4;
+  return Math.max(1, Math.min(6, Math.floor(n)));
+}
+
+export function resolveMaxToolCalls(env: Record<string, string | undefined> = process.env): number {
+  const n = Number(env.VAELOR_MAX_TOOL_CALLS ?? MAX_TOOL_CALLS_PER_TASK);
+  if (!Number.isFinite(n)) return MAX_TOOL_CALLS_PER_TASK;
+  return Math.max(1, Math.min(5, Math.floor(n)));
+}
+
+export function resolveMaxTaskExecutionMs(
+  env: Record<string, string | undefined> = process.env
+): number {
+  const n = Number(env.VAELOR_MAX_TASK_MS ?? MAX_TASK_EXECUTION_MS);
+  if (!Number.isFinite(n)) return MAX_TASK_EXECUTION_MS;
+  return Math.max(2_000, Math.min(60_000, Math.floor(n)));
+}
+
 const VALID_AGENTS = [
   'vaelor-core',
   'aurenyx-research',
@@ -44,6 +64,7 @@ const VALID_TOOLS = [
   'text_transformer',
   'json_validator',
   'structured_formatter',
+  'code_static_reviewer',
   'task_planner',
   'document_processor',
   'csv_analyzer',
@@ -63,7 +84,7 @@ export const TaskPlanSchema = z.object({
   detectedCategories: z.array(z.enum(VALID_TASK_TYPES)).min(1).max(6),
   selectedAgent: z.enum(VALID_AGENTS),
   requiresTools: z.boolean(),
-  permittedTools: z.array(z.enum(VALID_TOOLS)).max(13),
+  permittedTools: z.array(z.enum(VALID_TOOLS)).max(14),
   selectedTools: z.array(z.enum(VALID_TOOLS)).max(MAX_TOOL_CALLS_PER_TASK),
   isMultiStep: z.boolean(),
   requiresExternalEvidence: z.boolean(),

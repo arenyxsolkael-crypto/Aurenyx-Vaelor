@@ -7,6 +7,14 @@ import React, {
   useRef,
   useState,
 } from 'react';
+import { useAuth } from './AuthContext';
+import {
+  deleteCloudMemoryFromFirestore,
+  deleteCloudProjectFromFirestore,
+  syncCloudMemoryToFirestore,
+  syncCloudProjectToFirestore,
+  syncVerifiedUserToFirestore,
+} from '../lib/firebase';
 import type {
   AgentId,
   AgentMetadata,
@@ -55,8 +63,12 @@ export type ThemeMode = 'dark' | 'light';
 
 const THEME_STORAGE_KEY = 'vaelor_theme_mode';
 const PERSIST_PREF_KEY = 'vaelor_local_persist_enabled';
-const CONVERSATIONS_STORAGE_KEY = 'vaelor_saved_conversations_v1';
 const SESSION_TOKEN_STORAGE_KEY = 'vaelor_session_token_v1';
+
+function getConversationsStorageKey(uid?: string | null): string | null {
+  if (!uid) return null;
+  return `vaelor_saved_conversations_v2_${uid}`;
+}
 
 interface WorkspaceContextValue {
   theme: ThemeMode;
@@ -130,9 +142,58 @@ interface WorkspaceContextValue {
   createProject: (data: {
     name: string;
     objective: string;
+    description?: string;
+    brief?: string;
     category: ProjectWorkspace['category'];
   }) => Promise<{ ok: boolean; error?: string }>;
+  updateProject: (
+    id: string,
+    patch: {
+      name?: string;
+      objective?: string;
+      description?: string;
+      brief?: string;
+      category?: ProjectWorkspace['category'];
+      status?: ProjectWorkspace['status'];
+      addTaskPlan?: {
+        title: string;
+        steps: string[];
+        status?: 'planned' | 'in_progress' | 'completed';
+      };
+      updateTaskPlanStatus?: {
+        planId: string;
+        status: 'planned' | 'in_progress' | 'completed';
+      };
+      removeTaskPlanId?: string;
+      addSummary?: {
+        title: string;
+        summary: string;
+        sourceConversationId?: string;
+        approvedByUser?: boolean;
+      };
+      removeSummaryId?: string;
+    }
+  ) => Promise<{ ok: boolean; project?: ProjectWorkspace; error?: string }>;
+  exportProjectJson: (id: string) => Promise<{ ok: boolean; error?: string }>;
   removeProject: (id: string) => Promise<void>;
+
+  planWorkflowTask: (data: {
+    title: string;
+    objective: string;
+    preferredAgent?: AgentId;
+    projectId?: string;
+    researchMode?: boolean;
+    requiresApproval?: boolean;
+    requestedTools?: string[];
+  }) => Promise<{ ok: boolean; task?: StructuredTaskRun; error?: string }>;
+  executeWorkflowTask: (
+    taskId: string,
+    options?: {
+      confirmedByUser?: boolean;
+      mockMode?: boolean;
+      useSentinel?: boolean;
+    }
+  ) => Promise<{ ok: boolean; reply?: string; task?: StructuredTaskRun; error?: string }>;
 
   documents: KnowledgeDocument[];
   memories: SavedMemory[];
@@ -191,12 +252,16 @@ function readPersistencePref(): boolean {
   }
 }
 
-function readStoredConversations(fallback: Conversation): Conversation[] {
+function readStoredConversationsForUser(
+  uid: string | null | undefined,
+  fallback: Conversation
+): Conversation[] {
   try {
-    if (window.localStorage.getItem(PERSIST_PREF_KEY) !== 'true') {
+    const storageKey = getConversationsStorageKey(uid);
+    if (!storageKey || window.localStorage.getItem(PERSIST_PREF_KEY) !== 'true') {
       return [fallback];
     }
-    const raw = window.localStorage.getItem(CONVERSATIONS_STORAGE_KEY);
+    const raw = window.localStorage.getItem(storageKey);
     if (!raw) return [fallback];
     const parsed = JSON.parse(raw) as Conversation[];
     if (Array.isArray(parsed) && parsed.length > 0) {
@@ -223,6 +288,7 @@ function readOrCreateSessionToken(): string {
 }
 
 export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const { user, authReady, getFreshIdToken, refreshAccountSummary } = useAuth();
   const [sessionToken] = useState<string>(() => readOrCreateSessionToken());
   const [theme, setThemeState] = useState<ThemeMode>(() => readInitialTheme());
   const [localPersistenceEnabled, setLocalPersistenceState] = useState<boolean>(() =>
@@ -233,13 +299,9 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const [gatewayState, setGatewayState] = useState<GatewayStatusState>('checking');
   const [health, setHealth] = useState<HealthResponse | null>(null);
 
-  const initialConv = useMemo(() => makeEmptyConversation('proj_vaelor_01'), []);
-  const [conversations, setConversations] = useState<Conversation[]>(() =>
-    readStoredConversations(initialConv)
-  );
-  const [activeConversationId, setActiveConversationId] = useState<string>(
-    () => conversations[0]?.id ?? initialConv.id
-  );
+  const initialConv = useMemo(() => makeEmptyConversation(undefined), []);
+  const [conversations, setConversations] = useState<Conversation[]>(() => [initialConv]);
+  const [activeConversationId, setActiveConversationId] = useState<string>(() => initialConv.id);
 
   const [draftInput, setDraftInput] = useState('');
   const [preferredAgent, setPreferredAgent] = useState<AgentId | 'auto'>('auto');
@@ -255,7 +317,7 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const [composerError, setComposerError] = useState<string | null>(null);
 
   const [projects, setProjects] = useState<ProjectWorkspace[]>([]);
-  const [activeProjectId, setActiveProjectId] = useState<string | undefined>('proj_vaelor_01');
+  const [activeProjectId, setActiveProjectId] = useState<string | undefined>(undefined);
   const [documents, setDocuments] = useState<KnowledgeDocument[]>([]);
   const [memories, setMemories] = useState<SavedMemory[]>([]);
   const [agents, setAgents] = useState<AgentWithStats[]>([]);
@@ -264,6 +326,64 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const [evaluationSuite, setEvaluationSuite] = useState<EvaluationPromptCase[]>([]);
 
   const abortControllerRef = useRef<AbortController | null>(null);
+
+  /**
+   * Authenticated fetch wrapper that attaches verified Firebase ID tokens to protected API calls
+   * and automatically retries once with a forced token refresh on HTTP 401 SESSION_EXPIRED.
+   */
+  const authFetch = useCallback(
+    async (input: string, init: RequestInit = {}): Promise<Response> => {
+      const buildHeaders = async (forceRefresh: boolean): Promise<Headers> => {
+        const headers = new Headers(init.headers || {});
+        headers.set('X-Vaelor-Session-Token', sessionToken);
+        const token = await getFreshIdToken(forceRefresh);
+        if (token) {
+          headers.set('Authorization', `Bearer ${token}`);
+        }
+        return headers;
+      };
+
+      const firstRes = await fetch(input, {
+        ...init,
+        headers: await buildHeaders(false),
+      });
+
+      if (firstRes.status === 401 && user) {
+        const refreshedHeaders = await buildHeaders(true);
+        if (refreshedHeaders.has('Authorization')) {
+          return fetch(input, {
+            ...init,
+            headers: refreshedHeaders,
+          });
+        }
+      }
+
+      return firstRes;
+    },
+    [getFreshIdToken, sessionToken, user]
+  );
+
+  // Reset or hydrate user-namespaced conversations whenever the authenticated UID changes
+  useEffect(() => {
+    if (!authReady) return;
+    if (!user) {
+      const fresh = makeEmptyConversation(undefined);
+      setConversations([fresh]);
+      setActiveConversationId(fresh.id);
+      setProjects([]);
+      setActiveProjectId(undefined);
+      setDocuments([]);
+      setMemories([]);
+      setTasks([]);
+      setComposerError(null);
+      return;
+    }
+
+    const fallback = makeEmptyConversation(undefined);
+    const localRestored = readStoredConversationsForUser(user.uid, fallback);
+    setConversations(localRestored);
+    setActiveConversationId(localRestored[0]?.id ?? fallback.id);
+  }, [authReady, user?.uid]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -277,23 +397,28 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     } catch {
       // Ignore storage error
     }
-  }, [theme]);
+    if (user?.emailVerified) {
+      void syncVerifiedUserToFirestore(user, theme).catch(() => {});
+    }
+  }, [theme, user]);
 
   useEffect(() => {
     try {
+      const storageKey = getConversationsStorageKey(user?.uid);
+      if (!storageKey) return;
       if (localPersistenceEnabled) {
         const sanitized = conversations.slice(0, 20).map((c) => ({
           ...c,
           messages: c.messages.map((m) => ({ ...m, isStreaming: false })),
         }));
-        window.localStorage.setItem(CONVERSATIONS_STORAGE_KEY, JSON.stringify(sanitized));
+        window.localStorage.setItem(storageKey, JSON.stringify(sanitized));
       } else {
-        window.localStorage.removeItem(CONVERSATIONS_STORAGE_KEY);
+        window.localStorage.removeItem(storageKey);
       }
     } catch {
       // Ignore storage quota errors
     }
-  }, [conversations, localPersistenceEnabled]);
+  }, [conversations, localPersistenceEnabled, user?.uid]);
 
   const setTheme = useCallback((mode: ThemeMode) => {
     setThemeState(mode);
@@ -303,17 +428,21 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     setThemeState((prev) => (prev === 'dark' ? 'light' : 'dark'));
   }, []);
 
-  const setLocalPersistenceEnabled = useCallback((enabled: boolean) => {
-    setLocalPersistenceState(enabled);
-    try {
-      window.localStorage.setItem(PERSIST_PREF_KEY, enabled ? 'true' : 'false');
-      if (!enabled) {
-        window.localStorage.removeItem(CONVERSATIONS_STORAGE_KEY);
+  const setLocalPersistenceEnabled = useCallback(
+    (enabled: boolean) => {
+      setLocalPersistenceState(enabled);
+      try {
+        window.localStorage.setItem(PERSIST_PREF_KEY, enabled ? 'true' : 'false');
+        const storageKey = getConversationsStorageKey(user?.uid);
+        if (!enabled && storageKey) {
+          window.localStorage.removeItem(storageKey);
+        }
+      } catch {
+        // Ignore storage errors
       }
-    } catch {
-      // Ignore storage errors
-    }
-  }, []);
+    },
+    [user?.uid]
+  );
 
   const addAttachment = useCallback((att: ChatAttachment) => {
     setPendingAttachments((prev) => [...prev.slice(-1), att]);
@@ -329,7 +458,7 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const refreshHealth = useCallback(async () => {
     try {
-      const res = await fetch('/api/health');
+      const res = await authFetch('/api/health');
       if (res.status === 429) {
         return;
       }
@@ -343,20 +472,37 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     } catch {
       setGatewayState('offline');
     }
-  }, []);
+  }, [authFetch]);
 
   const refreshWorkspaceData = useCallback(async () => {
     try {
-      const [projRes, knowRes, agentsRes, tasksRes] = await Promise.all([
-        fetch('/api/projects'),
-        fetch('/api/knowledge'),
-        fetch('/api/agents'),
-        fetch('/api/tasks'),
+      // Public agents & tools metadata is always safe to load
+      const agentsRes = await authFetch('/api/agents');
+      if (agentsRes.ok) {
+        const d = (await agentsRes.json()) as { agents: AgentWithStats[]; tools: ToolInfo[] };
+        setAgents(d.agents ?? []);
+        setTools(d.tools ?? []);
+      }
+
+      if (!user) {
+        return;
+      }
+
+      const [projRes, knowRes, tasksRes, convRes] = await Promise.all([
+        authFetch('/api/projects'),
+        authFetch('/api/knowledge'),
+        authFetch('/api/tasks'),
+        authFetch('/api/conversations'),
       ]);
 
       if (projRes.ok) {
         const d = (await projRes.json()) as { projects: ProjectWorkspace[] };
-        setProjects(d.projects ?? []);
+        const loadedProjects = d.projects ?? [];
+        setProjects(loadedProjects);
+        setActiveProjectId((prev) => {
+          if (prev && loadedProjects.some((p) => p.id === prev)) return prev;
+          return loadedProjects[0]?.id;
+        });
       }
       if (knowRes.ok) {
         const d = (await knowRes.json()) as {
@@ -366,11 +512,6 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         setDocuments(d.documents ?? []);
         setMemories(d.memories ?? []);
       }
-      if (agentsRes.ok) {
-        const d = (await agentsRes.json()) as { agents: AgentWithStats[]; tools: ToolInfo[] };
-        setAgents(d.agents ?? []);
-        setTools(d.tools ?? []);
-      }
       if (tasksRes.ok) {
         const d = (await tasksRes.json()) as {
           tasks: StructuredTaskRun[];
@@ -379,15 +520,28 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         setTasks(d.tasks ?? []);
         setEvaluationSuite(d.evaluationSuite ?? []);
       }
+      if (convRes.ok) {
+        const d = (await convRes.json()) as { conversations: Conversation[] };
+        if (Array.isArray(d.conversations) && d.conversations.length > 0) {
+          setConversations((prev) => {
+            const hasActiveMessages = prev.some((c) => c.messages.length > 0);
+            if (hasActiveMessages) return prev;
+            setActiveConversationId(d.conversations[0].id);
+            return d.conversations;
+          });
+        }
+      }
+      void refreshAccountSummary();
     } catch {
       // Handled gracefully by offline status
     }
-  }, []);
+  }, [authFetch, refreshAccountSummary, user]);
 
   useEffect(() => {
+    if (!authReady) return;
     void refreshHealth();
     void refreshWorkspaceData();
-  }, [refreshHealth, refreshWorkspaceData]);
+  }, [authReady, user?.uid, refreshHealth, refreshWorkspaceData]);
 
   const activeConversation = useMemo(() => {
     return (
@@ -416,12 +570,12 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const syncConversationToServer = useCallback(
     async (conv: Conversation) => {
+      if (!user) return;
       try {
-        await fetch('/api/conversations', {
+        await authFetch('/api/conversations', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'X-Vaelor-Session-Token': sessionToken,
           },
           body: JSON.stringify({
             id: conv.id,
@@ -449,7 +603,7 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         // Offline / ephemeral fallback
       }
     },
-    [sessionToken]
+    [authFetch, user]
   );
 
   const renameConversation = useCallback(
@@ -460,19 +614,20 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         prev.map((c) => {
           if (c.id !== id) return c;
           const next = { ...c, title: clean, updatedAt: new Date().toISOString() };
-          void fetch(`/api/conversations/${encodeURIComponent(id)}`, {
-            method: 'PATCH',
-            headers: {
-              'Content-Type': 'application/json',
-              'X-Vaelor-Session-Token': sessionToken,
-            },
-            body: JSON.stringify({ title: clean }),
-          }).catch(() => {});
+          if (user) {
+            void authFetch(`/api/conversations/${encodeURIComponent(id)}`, {
+              method: 'PATCH',
+              headers: {
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({ title: clean }),
+            }).catch(() => {});
+          }
           return next;
         })
       );
     },
-    [sessionToken]
+    [authFetch, user]
   );
 
   const archiveConversation = useCallback(
@@ -488,29 +643,31 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           } else {
             const fresh = makeEmptyConversation(activeProjectId);
             setActiveConversationId(fresh.id);
-            void fetch(`/api/conversations/${encodeURIComponent(id)}`, {
-              method: 'PATCH',
-              headers: {
-                'Content-Type': 'application/json',
-                'X-Vaelor-Session-Token': sessionToken,
-              },
-              body: JSON.stringify({ archived }),
-            }).catch(() => {});
+            if (user) {
+              void authFetch(`/api/conversations/${encodeURIComponent(id)}`, {
+                method: 'PATCH',
+                headers: {
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ archived }),
+              }).catch(() => {});
+            }
             return [fresh, ...updated];
           }
         }
-        void fetch(`/api/conversations/${encodeURIComponent(id)}`, {
-          method: 'PATCH',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Vaelor-Session-Token': sessionToken,
-          },
-          body: JSON.stringify({ archived }),
-        }).catch(() => {});
+        if (user) {
+          void authFetch(`/api/conversations/${encodeURIComponent(id)}`, {
+            method: 'PATCH',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ archived }),
+          }).catch(() => {});
+        }
         return updated;
       });
     },
-    [activeConversationId, activeProjectId, sessionToken]
+    [activeConversationId, activeProjectId, authFetch, user]
   );
 
   const clearActiveConversation = useCallback(() => {
@@ -532,10 +689,11 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const deleteConversation = useCallback(
     (id: string) => {
-      void fetch(`/api/conversations/${encodeURIComponent(id)}`, {
-        method: 'DELETE',
-        headers: { 'X-Vaelor-Session-Token': sessionToken },
-      }).catch(() => {});
+      if (user) {
+        void authFetch(`/api/conversations/${encodeURIComponent(id)}`, {
+          method: 'DELETE',
+        }).catch(() => {});
+      }
       setConversations((prev) => {
         const remaining = prev.filter((c) => c.id !== id);
         if (remaining.length === 0) {
@@ -550,7 +708,7 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         return remaining;
       });
     },
-    [activeConversationId, activeProjectId, sessionToken]
+    [activeConversationId, activeProjectId, authFetch, user]
   );
 
   const stopWaiting = useCallback(() => {
@@ -574,6 +732,10 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     ) => {
       const text = (overrideMessage ?? draftInput).trim();
       if (!text || isSending) return;
+      if (!user) {
+        setComposerError('Please sign in to send messages to your private Vaelor workspace.');
+        return;
+      }
 
       const attachmentsToSend = [...pendingAttachments];
       const effectiveResearchMode = options?.researchModeOverride ?? researchMode;
@@ -618,8 +780,7 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       setConversations((prev) =>
         prev.map((c) => {
           if (c.id !== convId) return c;
-          const sliced =
-            truncateIdx >= 0 ? c.messages.slice(0, truncateIdx) : c.messages;
+          const sliced = truncateIdx >= 0 ? c.messages.slice(0, truncateIdx) : c.messages;
           const nextTitle =
             sliced.length === 0 && c.title === 'Untitled session'
               ? text.slice(0, 44) + (text.length > 44 ? '…' : '')
@@ -659,11 +820,10 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
       try {
         if (streamingEnabled) {
-          const res = await fetch('/api/chat/stream', {
+          const res = await authFetch('/api/chat/stream', {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
-              'X-Vaelor-Session-Token': sessionToken,
             },
             signal: controller.signal,
             body: JSON.stringify(requestBody),
@@ -711,7 +871,6 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
             return;
           }
 
-          // Insert placeholder streaming assistant message
           setConversations((prev) =>
             prev.map((c) =>
               c.id === convId
@@ -748,9 +907,7 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
             buffer = events.pop() ?? '';
 
             for (const rawBlock of events) {
-              const dataLine = rawBlock
-                .split('\n')
-                .find((l) => l.startsWith('data: '));
+              const dataLine = rawBlock.split('\n').find((l) => l.startsWith('data: '));
               if (!dataLine) continue;
 
               let evt: AIStreamEvent;
@@ -843,12 +1000,10 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           return;
         }
 
-        // Unary fallback path when streaming toggle is off
-        const res = await fetch('/api/chat', {
+        const res = await authFetch('/api/chat', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'X-Vaelor-Session-Token': sessionToken,
           },
           signal: controller.signal,
           body: JSON.stringify(requestBody),
@@ -962,6 +1117,7 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     [
       draftInput,
       isSending,
+      user,
       pendingAttachments,
       researchMode,
       activeConversation,
@@ -971,8 +1127,8 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       tone,
       responseLength,
       mockMode,
-      sessionToken,
       streamingEnabled,
+      authFetch,
       syncConversationToServer,
       refreshWorkspaceData,
       refreshHealth,
@@ -1030,6 +1186,10 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       if (isSending) return;
       const trimmed = params.prompt.trim();
       if (!trimmed) return;
+      if (!user) {
+        setComposerError('Please sign in to generate visual studio blueprints.');
+        return;
+      }
 
       setIsSending(true);
       setComposerError(null);
@@ -1057,7 +1217,7 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       );
 
       try {
-        const res = await fetch('/api/studio/visual', {
+        const res = await authFetch('/api/studio/visual', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1113,24 +1273,31 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         setIsSending(false);
       }
     },
-    [activeConversation.id, isSending]
+    [activeConversation.id, authFetch, isSending, user]
   );
 
   const createProject = useCallback(
     async (data: {
       name: string;
       objective: string;
+      description?: string;
+      brief?: string;
       category: ProjectWorkspace['category'];
     }) => {
       try {
-        const res = await fetch('/api/projects', {
+        const res = await authFetch('/api/projects', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+          },
           body: JSON.stringify(data),
         });
         const json = (await res.json()) as { project?: ProjectWorkspace; error?: string };
         if (!res.ok || !json.project) {
           return { ok: false, error: json.error || 'Could not create project.' };
+        }
+        if (user?.emailVerified) {
+          void syncCloudProjectToFirestore(user, json.project).catch(() => {});
         }
         await refreshWorkspaceData();
         await refreshHealth();
@@ -1140,19 +1307,179 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         return { ok: false, error: 'Network error creating project.' };
       }
     },
-    [refreshWorkspaceData, refreshHealth]
+    [authFetch, refreshWorkspaceData, refreshHealth, user]
+  );
+
+  const updateProject = useCallback(
+    async (
+      id: string,
+      patch: {
+        name?: string;
+        objective?: string;
+        description?: string;
+        brief?: string;
+        category?: ProjectWorkspace['category'];
+        status?: ProjectWorkspace['status'];
+        addTaskPlan?: {
+          title: string;
+          steps: string[];
+          status?: 'planned' | 'in_progress' | 'completed';
+        };
+        updateTaskPlanStatus?: {
+          planId: string;
+          status: 'planned' | 'in_progress' | 'completed';
+        };
+        removeTaskPlanId?: string;
+        addSummary?: {
+          title: string;
+          summary: string;
+          sourceConversationId?: string;
+          approvedByUser?: boolean;
+        };
+        removeSummaryId?: string;
+      }
+    ) => {
+      try {
+        const res = await authFetch(`/api/projects/${encodeURIComponent(id)}`, {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(patch),
+        });
+        const json = (await res.json()) as { project?: ProjectWorkspace; error?: string };
+        if (!res.ok || !json.project) {
+          return { ok: false, error: json.error || 'Could not update project.' };
+        }
+        if (user?.emailVerified) {
+          void syncCloudProjectToFirestore(user, json.project).catch(() => {});
+        }
+        await refreshWorkspaceData();
+        await refreshHealth();
+        return { ok: true, project: json.project };
+      } catch {
+        return { ok: false, error: 'Network error updating project.' };
+      }
+    },
+    [authFetch, refreshWorkspaceData, refreshHealth, user]
+  );
+
+  const exportProjectJson = useCallback(
+    async (id: string) => {
+      try {
+        const res = await authFetch(`/api/projects/${encodeURIComponent(id)}/export`);
+        const json = (await res.json()) as { error?: string };
+        if (!res.ok) {
+          return { ok: false, error: json.error || 'Could not export project JSON.' };
+        }
+        const blob = new Blob([JSON.stringify(json, null, 2)], {
+          type: 'application/json;charset=utf-8',
+        });
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = `vaelor-project-${id}.json`;
+        anchor.click();
+        URL.revokeObjectURL(url);
+        return { ok: true };
+      } catch {
+        return { ok: false, error: 'Network error exporting project JSON.' };
+      }
+    },
+    [authFetch]
   );
 
   const removeProject = useCallback(
     async (id: string) => {
-      await fetch(`/api/projects/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      await authFetch(`/api/projects/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      });
+      if (user?.emailVerified) {
+        void deleteCloudProjectFromFirestore(user, id).catch(() => {});
+      }
       if (activeProjectId === id) {
         setActiveProjectId(undefined);
       }
       await refreshWorkspaceData();
       await refreshHealth();
     },
-    [activeProjectId, refreshWorkspaceData, refreshHealth]
+    [activeProjectId, authFetch, refreshWorkspaceData, refreshHealth, user]
+  );
+
+  const planWorkflowTask = useCallback(
+    async (data: {
+      title: string;
+      objective: string;
+      preferredAgent?: AgentId;
+      projectId?: string;
+      researchMode?: boolean;
+      requiresApproval?: boolean;
+      requestedTools?: string[];
+    }) => {
+      try {
+        const res = await authFetch('/api/tasks/plan', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(data),
+        });
+        const json = (await res.json()) as { task?: StructuredTaskRun; error?: string };
+        if (!res.ok || !json.task) {
+          return { ok: false, error: json.error || 'Could not create task plan.' };
+        }
+        await refreshWorkspaceData();
+        await refreshHealth();
+        return { ok: true, task: json.task };
+      } catch {
+        return { ok: false, error: 'Network error creating task plan.' };
+      }
+    },
+    [authFetch, refreshWorkspaceData, refreshHealth]
+  );
+
+  const executeWorkflowTask = useCallback(
+    async (
+      taskId: string,
+      options?: {
+        confirmedByUser?: boolean;
+        mockMode?: boolean;
+        useSentinel?: boolean;
+      }
+    ) => {
+      try {
+        const res = await authFetch(`/api/tasks/${encodeURIComponent(taskId)}/execute`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            confirmedByUser: Boolean(options?.confirmedByUser),
+            mockMode: options?.mockMode ?? mockMode,
+            useSentinel: options?.useSentinel ?? useSentinel,
+          }),
+        });
+        const json = (await res.json()) as {
+          ok?: boolean;
+          reply?: string;
+          task?: StructuredTaskRun;
+          error?: string;
+        };
+        await refreshWorkspaceData();
+        await refreshHealth();
+        if (!res.ok || !json.task) {
+          return {
+            ok: false,
+            task: json.task,
+            error: json.error || 'Task workflow execution halted.',
+          };
+        }
+        return { ok: true, reply: json.reply, task: json.task };
+      } catch {
+        return { ok: false, error: 'Network error executing task workflow.' };
+      }
+    },
+    [authFetch, mockMode, refreshHealth, refreshWorkspaceData, useSentinel]
   );
 
   const ingestDocument = useCallback(
@@ -1163,9 +1490,11 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       content: string;
     }) => {
       try {
-        const res = await fetch('/api/knowledge/documents', {
+        const res = await authFetch('/api/knowledge/documents', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+          },
           body: JSON.stringify(data),
         });
         const json = (await res.json()) as { document?: KnowledgeDocument; error?: string };
@@ -1179,16 +1508,18 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         return { ok: false, error: 'Network error uploading document text.' };
       }
     },
-    [refreshWorkspaceData, refreshHealth]
+    [authFetch, refreshWorkspaceData, refreshHealth]
   );
 
   const removeDocument = useCallback(
     async (id: string) => {
-      await fetch(`/api/knowledge/documents/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      await authFetch(`/api/knowledge/documents/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      });
       await refreshWorkspaceData();
       await refreshHealth();
     },
-    [refreshWorkspaceData, refreshHealth]
+    [authFetch, refreshWorkspaceData, refreshHealth]
   );
 
   const saveMemory = useCallback(
@@ -1198,14 +1529,19 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       category: SavedMemory['category'];
     }) => {
       try {
-        const res = await fetch('/api/knowledge/memories', {
+        const res = await authFetch('/api/knowledge/memories', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+          },
           body: JSON.stringify(data),
         });
         const json = (await res.json()) as { memory?: SavedMemory; error?: string };
         if (!res.ok || !json.memory) {
           return { ok: false, error: json.error || 'Failed to save memory note.' };
+        }
+        if (user?.emailVerified) {
+          void syncCloudMemoryToFirestore(user, json.memory).catch(() => {});
         }
         await refreshWorkspaceData();
         await refreshHealth();
@@ -1214,25 +1550,29 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         return { ok: false, error: 'Network error saving memory note.' };
       }
     },
-    [refreshWorkspaceData, refreshHealth]
+    [authFetch, refreshWorkspaceData, refreshHealth, user]
   );
 
   const removeMemory = useCallback(
     async (id: string) => {
-      await fetch(`/api/knowledge/memories/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      await authFetch(`/api/knowledge/memories/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      });
+      if (user?.emailVerified) {
+        void deleteCloudMemoryFromFirestore(user, id).catch(() => {});
+      }
       await refreshWorkspaceData();
       await refreshHealth();
     },
-    [refreshWorkspaceData, refreshHealth]
+    [authFetch, refreshWorkspaceData, refreshHealth, user]
   );
 
   const purgeSessionData = useCallback(
     async (scope: 'conversations' | 'memories' | 'documents' | 'tasks' | 'all') => {
-      await fetch('/api/session/purge', {
+      await authFetch('/api/session/purge', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Vaelor-Session-Token': sessionToken,
         },
         body: JSON.stringify({ scope }),
       });
@@ -1241,7 +1581,10 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         setConversations([fresh]);
         setActiveConversationId(fresh.id);
         try {
-          window.localStorage.removeItem(CONVERSATIONS_STORAGE_KEY);
+          const storageKey = getConversationsStorageKey(user?.uid);
+          if (storageKey) {
+            window.localStorage.removeItem(storageKey);
+          }
         } catch {
           // Ignore storage error
         }
@@ -1252,7 +1595,7 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       await refreshWorkspaceData();
       await refreshHealth();
     },
-    [refreshWorkspaceData, refreshHealth, sessionToken]
+    [authFetch, refreshWorkspaceData, refreshHealth, user?.uid]
   );
 
   const value: WorkspaceContextValue = {
@@ -1306,7 +1649,11 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     activeProjectId,
     setActiveProjectId,
     createProject,
+    updateProject,
+    exportProjectJson,
     removeProject,
+    planWorkflowTask,
+    executeWorkflowTask,
     documents,
     memories,
     ingestDocument,
